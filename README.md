@@ -26,7 +26,7 @@
 | 缩进 | 用途 |
 |---|---|
 | 0 | 源目录 |
-| 4 空格 | 目标目录、`match:`、`exclude:`、`action:` |
+| 4 空格 | 目标目录、通配符、`match:`、`-`、`exclude:`、`action:` |
 | 8 空格 | 动作的参数 |
 
 约束：
@@ -44,8 +44,10 @@
 ```conf
 <源目录>                    # 0 缩进，可多行
     <目标目录>              # 4 缩进，裸路径 / 开头
-    match: <正则>           # 4 缩进，可多行
-    exclude: <正则>         # 4 缩进，可多行
+    <通配符>                # 4 缩进，裸行 = 通配符匹配
+    match: <正则>           # 4 缩进
+    - <通配符>              # 4 缩进，通配符排除
+    exclude: <正则>         # 4 缩进，正则排除
     action: <动作名>        # 4 缩进，开启动作段
         <参数>: <值>        # 8 缩进，属于上一个 action
 ```
@@ -78,32 +80,70 @@
     /__我的文件/_归档文件/_待处理/代办事项
 ```
 
-### 3.3 匹配条件 `match:`
+### 3.3 匹配条件：裸行（通配符）
 
-- 4 缩进，**可写多行**，多条之间是「或」
-- 值是**正则**，对**文件名**（不含路径）做「包含」匹配
+**日常用这个，最省事。**
+
+缩进的裸行就是一个通配符模式：
+
+```conf
+/DCIM/Screenshots
+    /__我的文件/_归档文件/_待处理/代办事项
+    com.microsoft.todos
+```
+
+- `*` 匹配任意多个字符，`?` 匹配一个字符
+- **没写 `*` 时按「包含」处理**，等价于 `*com.microsoft.todos*`
+- 大小写敏感，匹配对象是**文件名**（不含路径）
+- 可以写多行，多条之间是「或」
 - 一条都不写 = 全部文件
+
+```conf
+    *.jpg                 # 所有 jpg
+    Screenshot_*          # 以 Screenshot_ 开头
+    *com.tencent.mm*      # 含 com.tencent.mm
+    IMG_2026??_*.png      # 中间两位任意
+```
+
+### 3.4 匹配条件：`match:`（正则）
+
+需要捕获组、`^` `$` 锚点、`[0-9]{4}` 这类写法时才用它。
 
 ```conf
 /DCIM/Camera
     /__我的文件/_归档文件/购买建议/购买建议-奶茶
-    match: [0-9]{2}-.*(奶|茶)
+    match: ^[0-9]{2}-.*(奶|茶)$
 ```
 
-`26-奶茶.jpg` 命中；`咖啡.jpg` 不命中。
+- 值是正则，对文件名做 `search`（包含）匹配
+- 可写多行，多条之间是「或」
+- 可以和裸行混用，条件之间仍然是与「或」关系
 
-> 条件按正则解释，`com.microsoft.todos` 里的 `.` 是任意字符。要精确匹配点号得写 `com\.microsoft\.todos`。
+> 裸行和 `match:` 的区别只有一处：**裸行是通配符，`match:` 是正则**。通配符里 `(` `)` `[` `]` `.` 都是普通字符。
 
-### 3.4 排除条件 `exclude:`
+### 3.5 排除条件
 
-- 4 缩进，可多行
-- 命中的文件**跳过不动**
+两种写法，对应用「跳过」的文件：
+
+```conf
+    - *.jpg               # 通配符排除（推荐）
+    - *.png
+```
+
+```conf
+    exclude: \.bak$       # 正则排除
+```
+
+- `- ` 开头 = 通配符排除
+- `exclude:` = 正则排除
+- 命中即跳过，不移动也不改名
 
 ```conf
 /Download
     /Download/new_dir
-    match: [0-9a-z]{20,}
-    exclude: .+(jpg|txt)
+    [0-9a-z]{20,}
+    - *.jpg
+    - *.txt
 ```
 
 ---
@@ -253,14 +293,14 @@ action: rename
 # 归并待 todo 图片
 /DCIM/Screenshots
     /__我的文件/_归档文件/_待处理/代办事项
-    match: com.microsoft.todos
+    com.microsoft.todos
 
 # 待消费
 /DCIM/Screenshots
     /__我的文件/_归档文件/_待处理/待消费
-    match: net.hpoi
-    match: com.taobao.taobao
-    match: com.xunmeng.pinduoduo
+    net.hpoi
+    com.taobao.taobao
+    com.xunmeng.pinduoduo
 
 # 收藏视频：移动
 /Download/Seal
@@ -279,8 +319,8 @@ action: rename
 # AI 截图按时间重命名
 /Pictures/Screenshots
     /Pictures/Deepseek
-    match: com.deepseek.chat
-    match: com.openai.chatgpt
+    com.deepseek.chat
+    com.openai.chatgpt
     action: rename
         to: {mtime:%Y%m%d_%H%M%S}.{ext}
 
@@ -305,6 +345,7 @@ action: rename
 | 缩进 | 只允许 0 / 4 / 8 空格；禁止 Tab；禁止跳级 |
 | 结构 | 源目录必须顶格且 `/` 开头；目标最多一个；8 缩进必须跟在 `action:` 后 |
 | 动作 | 动作名是否认识；必需参数是否缺失；参数名是否属于该动作 |
+| 通配符 | 裸行是否形似已知指令（如 `matchs:`，疑似拼写错误） |
 | 正则 | `match:` / `exclude:` / `replace:` 能否编译 |
 | 变量 | 是否在已知变量表里；时间变量参数是否合法 |
 | 路径 | 必须 `/` 开头；不能含反斜杠；不能有重复斜杠 |
@@ -326,8 +367,8 @@ action: rename
 
 | v1 写法 | v2 写法 |
 |---|---|
-| 裸正则行当条件 | `match: 正则` |
-| `- 正则` / `-: 正则` | `exclude: 正则` |
+| 裸正则行当条件 | 裸行改通配符；需要正则时写 `match:` |
+| `- 正则` / `-: 正则` | `- 通配符` 或 `exclude: 正则` |
 | `target:` 作重命名模板 | `action: rename` + 8 缩进的 `to:` |
 | `.Prefix:` | `action: rename` + `prefix:` |
 | `.replace:` | `action: rename` + `replace:` / `with:` |
