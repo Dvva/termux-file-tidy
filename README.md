@@ -119,8 +119,8 @@
 
 ```conf
 /__我的文件/收藏视频
-    action: replace
-        pattern: BV([0-9a-z]{4,})_
+    action: rename
+        replace: BV([0-9a-z]{4,})_
         with:
     action: command
         cmd: video-add-file {}
@@ -133,38 +133,71 @@
 
 > 没有任何 `action:` 的块，默认动作为 **move**（移动到目标目录）。
 
+块级目标目录和 `action:` 可以并存：**目标是「去哪」，动作是「做什么」**。例如同时写目标目录和 `action: rename`，表示移动到该目录并改名。
+
 ---
 
 ## 五、动作清单
+
+所有「改名」都走 `rename`，用参数区分具体怎么改。
 
 | 动作 | 参数 | 说明 |
 |---|---|---|
 | `move` | `to:` | 移动文件（**默认**） |
 | `copy` | `to:` | 复制文件，源保留 |
-| `rename` | `to:` | 整体改名 |
-| `prefix` | `text:` | 文件名前加内容 |
-| `suffix` | `text:` | 扩展名前加内容 |
-| `replace` | `pattern:`、`with:` | 正则替换；`with:` 为空表示删除匹配部分 |
-| `ext` | `to:` | 修改扩展名 |
-| `case` | `style:` | `lower` / `upper` / `title` |
-| `sanitize` | —— | 去掉文件名非法字符 |
-| `sequence` | `format:` | 按顺序编号，格式如 `{index:03d}` |
+| `rename` | 见下表 | 重命名，所有改名操作统一入口 |
 | `command` | `cmd:` | 执行 shell 命令，`{}` 代表当前文件路径 |
 | `append` | `text:`、`file:` | 向 `file:` 追加 `text:` |
 | `clean` | —— | 收尾时清空该源目录下的空文件夹 |
 
-### 参数取值
+### rename 的参数
 
 | 参数 | 说明 |
 |---|---|
-| `to:` | 目标目录或目标文件名，支持模板变量 |
-| `text:` | 纯文本，支持模板变量 |
-| `pattern:` | 正则 |
-| `with:` | 替换内容，可为空 |
-| `style:` | `lower` / `upper` / `title` |
-| `format:` | 序号格式，如 `{index:03d}` |
-| `cmd:` | shell 命令，`{}` = 文件路径 |
-| `file:` | 文件路径，支持模板变量 |
+| `to:` | 完整的**目标文件名模板**，与下面所有参数互斥 |
+| `replace:` + `with:` | 正则替换，`with:` 为空表示删除匹配部分 |
+| `prefix:` | 文件名前加内容 |
+| `suffix:` | 扩展名前加内容 |
+| `ext:` | 修改扩展名 |
+| `case:` | `lower` / `upper` / `title` |
+| `sanitize:` | `true`，去掉文件名里的非法字符 |
+| `sequence:` | 编号格式，如 `{index:03d}` |
+
+**执行顺序固定**，与书写顺序无关：
+
+```
+sanitize → replace → case → prefix → suffix → ext → sequence
+```
+
+写了 `to:` 就不用其他参数（同时写会报错），因为 `to:` 已经直接给出最终结果。
+
+```conf
+# 加前缀
+action: rename
+    prefix: __
+
+# 去掉 BV 号前缀
+action: rename
+    replace: BV([0-9a-z]{4,})_
+    with:
+
+# 按时间整体重命名
+action: rename
+    to: {mtime:%Y%m%d_%H%M%S}.{ext}
+```
+
+### 通用参数
+
+所有动作都支持，含义随动作变化：
+
+| 参数 | 用于 | 说明 |
+|---|---|---|
+| `match:` | 全部 | 在该动作内部再筛一次；可多行，也可省略 |
+| `to:` | move / copy | 目标目录 |
+| `to:` | rename | 目标文件名模板 |
+| `text:` | append | 要追加的内容 |
+| `file:` | append | 追加到哪个文件 |
+| `cmd:` | command | 要执行的命令，`{}` = 文件路径 |
 
 ---
 
@@ -237,8 +270,8 @@ action: rename
 # 收藏视频：重命名 + 登记
 /__我的文件/收藏视频
     match: BV([0-9a-z]{4,})_
-    action: replace
-        pattern: BV([0-9a-z]{4,})_
+    action: rename
+        replace: BV([0-9a-z]{4,})_
         with:
     action: command
         cmd: video-add-file {}
@@ -272,7 +305,7 @@ action: rename
 | 缩进 | 只允许 0 / 4 / 8 空格；禁止 Tab；禁止跳级 |
 | 结构 | 源目录必须顶格且 `/` 开头；目标最多一个；8 缩进必须跟在 `action:` 后 |
 | 动作 | 动作名是否认识；必需参数是否缺失；参数名是否属于该动作 |
-| 正则 | `match:` / `exclude:` / `pattern:` 能否编译 |
+| 正则 | `match:` / `exclude:` / `replace:` 能否编译 |
 | 变量 | 是否在已知变量表里；时间变量参数是否合法 |
 | 路径 | 必须 `/` 开头；不能含反斜杠；不能有重复斜杠 |
 
@@ -296,8 +329,8 @@ action: rename
 | 裸正则行当条件 | `match: 正则` |
 | `- 正则` / `-: 正则` | `exclude: 正则` |
 | `target:` 作重命名模板 | `action: rename` + 8 缩进的 `to:` |
-| `.Prefix:` | `action: prefix` + `text:` |
-| `.replace:` | `action: replace` + `pattern:` / `with:` |
+| `.Prefix:` | `action: rename` + `prefix:` |
+| `.replace:` | `action: rename` + `replace:` / `with:` |
 | `reg:` | 放回 `action:` 段下的 `match:` |
 | `write_append:` | `action: append` |
 | `delete-empty: true` | `action: clean` |
