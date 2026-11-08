@@ -87,6 +87,7 @@ class Block:
     actions: list[Action] = field(default_factory=list)
     skip: bool = False
     clean: bool = False
+    max_depth: int = 0          # 0 = 无限递归；1 = 只看源目录这一层
     dirs: list[Path] = field(default_factory=list)  # 展开后的真实目录
 
     def is_complete(self) -> bool:
@@ -242,6 +243,15 @@ def parse(text: str, source_name: str = "<config>") -> tuple[list[Block], list[I
                     issues.append(Issue(lineno, ERROR,
                                         f"skip 只能是 true/false，实际是：{val}"))
                 cur.skip = val == "true"
+                continue
+
+            if content.startswith("depth:"):
+                val = content[len("depth:"):].strip()
+                if not val.isdigit() or int(val) < 1:
+                    issues.append(Issue(lineno, ERROR,
+                                        f"depth 必须是正整数，实际是：{val}"))
+                else:
+                    cur.max_depth = int(val)
                 continue
 
             if content.startswith("action:"):
@@ -423,11 +433,24 @@ def owner_blocks(blocks: Iterable[Block], path: Path) -> list[Block]:
 
     一个文件可能被父目录的源扫到，但它只属于层级最深的那些块。
     按源深度降序、配置文件行号升序排列，保证具体规则优先于笼统规则。
+
+    块的 max_depth 会限制文件相对源目录的层数：
+      max_depth=1 时，源目录直接下的文件才算，子目录里的不算。
     """
-    cands = [
-        b for b in blocks
-        if any(path.is_relative_to(d) for d in b.dirs)
-    ]
+    cands: list[Block] = []
+    for b in blocks:
+        hit = False
+        for d in b.dirs:
+            try:
+                rel = path.relative_to(d)
+            except ValueError:
+                continue
+            if b.max_depth and len(rel.parts) > b.max_depth:
+                continue
+            hit = True
+            break
+        if hit:
+            cands.append(b)
     cands.sort(key=lambda b: (-b.depth, b.line))
     return cands
 

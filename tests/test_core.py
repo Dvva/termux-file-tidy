@@ -385,5 +385,23 @@ class TestIgnore(unittest.TestCase):
             self.assertEqual(got, [inside])
 
 
+    def test_depth_limits_recursion(self):
+        """depth: 1 只看源目录这一层，不进子目录"""
+        from tidy_core import attach_sources, owner_blocks
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "DL"
+            (src / "sub").mkdir(parents=True)
+            (src / "a.jpg").write_text("x")
+            (src / "sub" / "b.jpg").write_text("y")
+
+            blocks, _, _ = parse("/DL\n    /out\n    depth: 1\n")
+            attach_sources(blocks, root)
+
+            self.assertEqual(len(owner_blocks(blocks, src / "a.jpg")), 1)
+            self.assertEqual(len(owner_blocks(blocks, src / "sub" / "b.jpg")), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
