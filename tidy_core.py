@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
@@ -137,9 +138,10 @@ ACTION_PARAMS = {
 }
 
 KNOWN_VARS = {"name", "ext", "full", "dir", "mtime", "ctime", "atime", "btime",
-              "now", "date", "timestamp", "index", "count", "hash"}
+              "now", "date", "timestamp", "index", "count", "hash", "rand"}
 
-VAR_WITH_ARG = {"mtime", "ctime", "atime", "btime", "now", "date", "index", "hash"}
+VAR_WITH_ARG = {"mtime", "ctime", "atime", "btime", "now", "date", "index",
+                "hash", "rand"}
 
 # 动作参数里允许写模板变量的键
 TEMPLATE_KEYS = {"to", "text", "file", "cmd"}
@@ -538,6 +540,16 @@ def _var_index(ctx: FileRef, arg: str) -> str:
         return str(ctx.index)
 
 
+def _var_rand(ctx: FileRef, arg: str) -> str:
+    """随机数字，参数是位数，默认 3 位。用于给同秒文件加区分后缀。"""
+    try:
+        width = int(arg) if arg else 3
+    except ValueError:
+        width = 3
+    width = max(1, min(width, 9))
+    return str(random.randint(0, 10 ** width - 1)).zfill(width)
+
+
 VARS: dict[str, Callable[[FileRef, str], str]] = {
     "name": lambda c, a: c.path.stem,
     "ext": lambda c, a: c.path.suffix.lstrip("."),
@@ -549,7 +561,8 @@ VARS: dict[str, Callable[[FileRef, str], str]] = {
     "btime": lambda c, a: _fmt_time(_birth_time(c.stat), a),
     "now": lambda c, a: _fmt_time(time.time(), a),
     "date": lambda c, a: _fmt_time(c.stat.st_mtime, a),
-    "timestamp": lambda c, a: str(int(c.stat.st_mtime * 1000)),
+    "timestamp": lambda c, a: str(int(c.stat.st_mtime)),
+    "rand": _var_rand,
     "index": _var_index,
     "count": lambda c, a: str(c.total),
     "hash": _var_hash,

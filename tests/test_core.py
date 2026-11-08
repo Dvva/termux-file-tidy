@@ -161,16 +161,24 @@ class TestRender(unittest.TestCase):
             self.assertEqual(render("{count}", ref), "10")
             self.assertRegex(render("{mtime:%Y}", ref), r"^\d{4}$")
 
-    def test_timestamp_is_milliseconds(self):
-        """{timestamp} 是毫秒级，13 位数字"""
+    def test_timestamp_and_rand(self):
+        """{timestamp} 是秒级 10 位；{rand:3} 是 3 位随机数字"""
         from tidy_core import FileRef
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "a.jpg"
             p.write_text("x")
             ref = FileRef(path=p, stat=p.stat())
+
             ts = render("{timestamp}", ref)
             self.assertTrue(ts.isdigit())
-            self.assertGreaterEqual(len(ts), 13)
+            self.assertEqual(len(ts), 10)
+
+            r = render("{rand:3}", ref)
+            self.assertEqual(len(r), 3)
+            self.assertTrue(r.isdigit())
+
+            r5 = render("{rand:5}", ref)
+            self.assertEqual(len(r5), 5)
 
     def test_btime(self):
         """创建时间：系统不支持时回退 mtime，且 %s 返回 Unix 秒"""
