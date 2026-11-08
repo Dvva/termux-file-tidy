@@ -170,7 +170,14 @@ def embed_cover(video: Path, cover: Path) -> None:
 
 
 def append_record(path: Path, meta: dict, video: Path) -> None:
+    """追加记录；同一个 BV 号只记一次，避免重复运行刷屏"""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            if meta["bvid"] in path.read_text(encoding="utf-8"):
+                return
+        except OSError:
+            pass
     new = not path.exists()
     with path.open("a", encoding="utf-8") as fh:
         if new:
@@ -201,6 +208,15 @@ def process(video: Path, *, do_cover: bool,
     if not bvid:
         say(f"跳过（没有 BV 号）：{video.name}")
         return 0
+
+    # 已经写过封面、记录里也有，说明处理过，不再重复查接口
+    if do_cover and record and record.exists() and has_cover(video):
+        try:
+            if bvid in record.read_text(encoding="utf-8"):
+                say(f"已处理过，跳过：{video.name}")
+                return 0
+        except OSError:
+            pass
 
     try:
         meta = fetch_meta(bvid)

@@ -28,11 +28,11 @@ from tidy_core import (
     attach_sources,
     clean_empty_dirs,
     expand_ignores,
-    expand_sources,
     match_block,
     owner_blocks,
     parse,
     scan,
+    targets_to_skip,
     to_real,
     undo,
 )
@@ -150,7 +150,11 @@ def run(args: argparse.Namespace) -> int:
         if b.clean:
             clean_dirs.extend(b.dirs)
 
-    files = scan(all_sources, targets, ignore_dirs, args.include_hidden)
+    # 只有「落在某个源目录内部」的目标才需要排除，避免刚移进去又被扫出来。
+    # 目标本身是另一个块的源（链式规则，如 先移动到 X 再对 X 重命名）时不能排除。
+    scan_skip = targets_to_skip(targets, all_sources)
+
+    files = scan(all_sources, scan_skip, ignore_dirs, args.include_hidden)
     log.info("扫描到 %d 个文件，%d 个规则块（跳过 %d）", len(files), len(active), skipped)
 
     engine = Engine(root=root, dry_run=args.dry_run, undo_path=undo_path)

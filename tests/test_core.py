@@ -211,6 +211,26 @@ class TestEngine(unittest.TestCase):
             self.assertTrue((src / "a.txt").exists())
             self.assertFalse((root / "dst" / "a.txt").exists())
 
+    def test_command_only_block_runs_in_place(self):
+        """只有 command、没有移动/改名的块也要执行"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "videos"
+            src.mkdir()
+            (src / "a.txt").write_text("x")
+
+            blocks, _, _ = parse(
+                "/videos\n"
+                "    action: command\n"
+                "        cmd: echo {}\n"
+            )
+            files = scan([src], [])
+            engine = Engine(root=root, dry_run=True)
+            plan = engine.plan(blocks[0], files[0])
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan.dst, files[0].path)
+            self.assertIsNotNone(plan.command)
+
     def test_expand_sources(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -280,6 +300,22 @@ class TestIgnore(unittest.TestCase):
 
             files = scan([src], [], [src])
             self.assertEqual(files, [])
+
+    def test_targets_to_skip(self):
+        """目标在源内部才排除；目标本身是别的源时保留（链式规则）"""
+        from tidy_core import targets_to_skip
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            inside = root / "Pictures" / "Deepseek"
+            outside = root / "收藏视频"
+            inside.mkdir(parents=True)
+            outside.mkdir()
+
+            # outside 同时是源，不能被排除
+            got = targets_to_skip([inside, outside],
+                                  [root / "Pictures", outside])
+            self.assertEqual(got, [inside])
 
 
 if __name__ == "__main__":

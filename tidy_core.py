@@ -358,6 +358,24 @@ def _under(path: Path, roots: Iterable[Path]) -> bool:
     return False
 
 
+def targets_to_skip(targets: Iterable[Path], sources: Iterable[Path]) -> list[Path]:
+    """
+    只有「落在某个源目录内部、且本身不是源」的目标才需要从扫描中排除。
+
+    否则会出现两种情况之一：
+      - 目标在源内部：刚移进去的文件又被扫出来，重复处理
+      - 目标本身是另一个块的源（链式规则）：不该排除，否则那条规则永远空转
+    """
+    src = list(sources)
+    out: list[Path] = []
+    for t in targets:
+        if t in src:
+            continue          # 目标本身就是源，必须扫描
+        if _under(t, src):
+            out.append(t)
+    return out
+
+
 def wildcard_match(name: str, pattern: str) -> bool:
     """通配符匹配；没写通配符时按「包含」处理"""
     if has_wildcard(pattern):
@@ -670,7 +688,8 @@ class Engine:
                 return None
 
         dst = dest_dir / name
-        if dst == f.path:
+        # 原地不动但仍有副作用动作（command / append）时，必须继续往下走
+        if dst == f.path and not command and append_text is None:
             return None
         return Plan(src=f.path, dst=dst, action=op, command=command,
                     append_text=append_text, append_file=append_file)
@@ -690,22 +709,25 @@ class Engine:
 
     # ---------- 执行 ----------
     def run_plan(self, plan: Plan, taken: set[Path]) -> Result:
-        dst = self.resolve_conflict(plan.dst, taken)
+        in_place = plan.dst == plan.src
+        dst = plan.src if in_place else self.resolve_conflict(plan.dst, taken)
 
         if self.dry_run:
             return Result(src=plan.src, dst=dst, ok=True, note="dry-run")
 
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if plan.action == "copy":
-                shutil.copy2(plan.src, dst)
-            else:
-                shutil.move(str(plan.src), str(dst))
+            if not in_place:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if plan.action == "copy":
+                    shutil.copy2(plan.src, dst)
+                else:
+                    shutil.move(str(plan.src), str(dst))
         except OSError as exc:
             return Result(src=plan.src, ok=False, error=str(exc))
 
-        taken.add(dst)
-        self.undo_lines.append(f"{plan.action}\t{plan.src}\t{dst}")
+        if not in_place:
+            taken.add(dst)
+            self.undo_lines.append(f"{plan.action}\t{plan.src}\t{dst}")
 
         if plan.command:
             try:
