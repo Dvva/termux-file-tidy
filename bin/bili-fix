@@ -44,7 +44,7 @@ API = "https://api.bilibili.com/x/web-interface/view?bvid={}"
 BV_RE = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
 
 # 记录文件名固定，放在视频所在目录下
-RECORD_NAME = "bili-downloads.tsv"
+RECORD_NAME = "bili-downloads.txt"
 
 # 文件名里不能出现的字符
 ILLEGAL = re.compile(r'[\\/:*?"<>|\r\n\t]')
@@ -167,25 +167,21 @@ def embed_cover(video: Path, cover: Path) -> None:
 
 
 def append_record(path: Path, meta: dict, video: Path) -> None:
-    """追加记录；同一个 BV 号只记一次，避免重复运行刷屏"""
+    """追加一行「BV号<tab>标题」；同一个 BV 号只记一次"""
     path.parent.mkdir(parents=True, exist_ok=True)
+    bvid = meta["bvid"]
+    title = meta.get("title", "").replace("\t", " ").replace("\n", " ").strip()
+
     if path.exists():
         try:
-            if meta["bvid"] in path.read_text(encoding="utf-8"):
-                return
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.split("\t", 1)[0].strip() == bvid:
+                    return
         except OSError:
             pass
-    new = not path.exists()
+
     with path.open("a", encoding="utf-8") as fh:
-        if new:
-            fh.write("bv\t日期\tUP主\t标题\t文件\n")
-        fh.write("\t".join([
-            meta["bvid"],
-            str(meta.get("pubdate", "")),
-            meta.get("owner", ""),
-            meta.get("title", ""),
-            video.name,
-        ]) + "\n")
+        fh.write(f"{bvid}\t{title}\n")
 
 
 # ============================================================
