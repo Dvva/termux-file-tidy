@@ -270,6 +270,17 @@ class TestIgnore(unittest.TestCase):
             self.assertEqual(sorted(f.path.name for f in all_files),
                              ["a.jpg", "b.jpg", "c.jpg"])
 
+    def test_scan_skips_ignored_source_root(self):
+        """源目录本身被 ignore 时，整个源都跳过"""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "同人图"
+            src.mkdir()
+            (src / "a.jpg").write_text("x")
+
+            files = scan([src], [], [src])
+            self.assertEqual(files, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

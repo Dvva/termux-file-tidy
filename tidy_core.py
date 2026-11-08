@@ -420,6 +420,12 @@ def scan(dirs: Iterable[Path], skip: Iterable[Path],
     for d in dirs:
         if not d.is_dir():
             continue
+        # 源目录本身也可能在 ignore 列表里，先挡掉
+        try:
+            if _under(d.resolve(), ignore_set):
+                continue
+        except OSError:
+            continue
         for cur_dir, dirnames, filenames in os.walk(d):
             cur = Path(cur_dir)
             kept = []
