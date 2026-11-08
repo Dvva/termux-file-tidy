@@ -74,7 +74,7 @@ def main() -> int:
         return 2
 
     text = path.read_text(encoding="utf-8")
-    blocks, issues = parse(text, str(path))
+    blocks, issues, ignores = parse(text, str(path))
 
     entries = [(i.line, i.level, i.msg) for i in issues]
     entries.extend(check_templates(blocks))
@@ -95,7 +95,7 @@ def main() -> int:
 
     print("-" * 56)
     print(f"共 {len(text.splitlines())} 行，{len(blocks)} 个规则块，"
-          f"错误 {n_err}，警告 {n_warn}")
+          f"{len(ignores)} 条 ignore，错误 {n_err}，警告 {n_warn}")
 
     if n_err:
         return 1

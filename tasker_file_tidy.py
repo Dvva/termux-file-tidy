@@ -27,6 +27,7 @@ from tidy_core import (
     Engine,
     attach_sources,
     clean_empty_dirs,
+    expand_ignores,
     expand_sources,
     match_block,
     owner_blocks,
@@ -107,7 +108,7 @@ def run(args: argparse.Namespace) -> int:
     log_path = setup_logging(args.verbose)
 
     text = config_path.read_text(encoding="utf-8")
-    blocks, issues = parse(text, str(config_path))
+    blocks, issues, raw_ignores = parse(text, str(config_path))
 
     errors = [i for i in issues if i.level == ERROR]
     if errors:
@@ -134,6 +135,9 @@ def run(args: argparse.Namespace) -> int:
 
     # 展开每个块的源目录，后面用来判断文件归属
     attach_sources(active, root)
+    ignore_dirs = expand_ignores(raw_ignores, root)
+    if ignore_dirs:
+        log.info("忽略 %d 个目录", len(ignore_dirs))
 
     # 收集源目录与目标目录
     all_sources: list[Path] = []
@@ -146,7 +150,7 @@ def run(args: argparse.Namespace) -> int:
         if b.clean:
             clean_dirs.extend(b.dirs)
 
-    files = scan(all_sources, targets)
+    files = scan(all_sources, targets, ignore_dirs, args.include_hidden)
     log.info("扫描到 %d 个文件，%d 个规则块（跳过 %d）", len(files), len(active), skipped)
 
     engine = Engine(root=root, dry_run=args.dry_run, undo_path=undo_path)
@@ -178,7 +182,9 @@ def run(args: argparse.Namespace) -> int:
 
     removed: list[Path] = []
     if clean_dirs:
-        removed = clean_empty_dirs(clean_dirs, dry_run=args.dry_run)
+        removed = clean_empty_dirs(clean_dirs, dry_run=args.dry_run,
+                                   ignores=ignore_dirs,
+                                   include_hidden=args.include_hidden)
 
     engine.save_undo()
 
@@ -217,6 +223,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="输出详细日志")
     p.add_argument("--no-notify", action="store_true",
                    help="不发送 Termux 通知")
+    p.add_argument("--include-hidden", action="store_true",
+                   help="也处理 . 开头的隐藏目录（默认跳过）")
     return p
 
 

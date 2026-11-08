@@ -152,10 +152,14 @@ def _indent_of(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
 
-def parse(text: str, source_name: str = "<config>") -> tuple[list[Block], list[Issue]]:
-    """把配置文本解析成规则块列表"""
+def parse(text: str, source_name: str = "<config>") -> tuple[list[Block], list[Issue], list[tuple[str, int]]]:
+    """把配置文本解析成规则块列表、问题列表、全局忽略目录
+
+    ignore: 是全局的，出现在任意位置都作用于所有块。
+    """
     blocks: list[Block] = []
     issues: list[Issue] = []
+    ignores: list[tuple[str, int]] = []
     cur: Block | None = None
     act: Action | None = None
 
@@ -175,8 +179,15 @@ def parse(text: str, source_name: str = "<config>") -> tuple[list[Block], list[I
             issues.append(Issue(lineno, ERROR,
                                 f"缩进 {indent} 格不合法，只能是 0 / 4 / 8"))
 
-        # ---------- 顶格：源目录 ----------
+        # ---------- 顶格：全局忽略 / 源目录 ----------
         if indent == 0:
+            if content.startswith("ignore:"):
+                pat = content[len("ignore:"):].strip()
+                if not pat:
+                    issues.append(Issue(lineno, ERROR, "ignore 的值为空"))
+                else:
+                    ignores.append((pat, lineno))
+                continue
             if not content.startswith("/"):
                 issues.append(Issue(lineno, ERROR,
                                     f"顶格行必须以 / 开头，实际是：{content[:30]}"))
@@ -273,7 +284,7 @@ def parse(text: str, source_name: str = "<config>") -> tuple[list[Block], list[I
         if b.target and not b.sources:
             issues.append(Issue(b.line, ERROR, "这个块缺少源目录"))
 
-    return blocks, issues
+    return blocks, issues, ignores
 
 
 def _check_regex(pattern: str, lineno: int, kind: str, issues: list[Issue]) -> None:
@@ -316,6 +327,35 @@ def expand_sources(sources: Iterable[str], root: Path) -> list[Path]:
             else:
                 log.warning("源目录不存在：%s", p)
     return out
+
+
+def expand_ignores(entries: Iterable[tuple[str, int]], root: Path) -> list[Path]:
+    """展开配置里的 ignore 目录（支持通配符），只保留真实存在的目录"""
+    out: list[Path] = []
+    for s, _line in entries:
+        if has_wildcard(s):
+            try:
+                out.extend(p for p in root.glob(s.lstrip("/")) if p.is_dir())
+            except (OSError, ValueError):
+                pass
+        else:
+            p = to_real(s, root)
+            if p.is_dir():
+                out.append(p)
+    return out
+
+
+def _under(path: Path, roots: Iterable[Path]) -> bool:
+    """path 是否落在 roots 里的某个目录（含自身）"""
+    for r in roots:
+        if path == r:
+            return True
+        try:
+            if path.is_relative_to(r):
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
 
 
 def wildcard_match(name: str, pattern: str) -> bool:
@@ -369,9 +409,11 @@ def owner_blocks(blocks: Iterable[Block], path: Path) -> list[Block]:
 # ============================================================
 
 
-def scan(dirs: Iterable[Path], skip: Iterable[Path]) -> list[FileRef]:
-    """递归收集文件，跳过目标目录和隐藏目录"""
-    skip_set = {p.resolve() for p in skip if p}
+def scan(dirs: Iterable[Path], skip: Iterable[Path],
+         ignores: Iterable[Path] = (), include_hidden: bool = False) -> list[FileRef]:
+    """递归收集文件，跳过目标目录、ignore 目录和隐藏目录"""
+    skip_set = [p.resolve() for p in skip if p]
+    ignore_set = [p.resolve() for p in ignores if p]
     seen: set[Path] = set()
     files: list[FileRef] = []
 
@@ -380,12 +422,24 @@ def scan(dirs: Iterable[Path], skip: Iterable[Path]) -> list[FileRef]:
             continue
         for cur_dir, dirnames, filenames in os.walk(d):
             cur = Path(cur_dir)
-            # 就地裁剪，避免走进目标目录
-            dirnames[:] = [
-                n for n in dirnames
-                if (cur / n).resolve() not in skip_set
-            ]
+            kept = []
+            for n in dirnames:
+                # 默认不进入隐藏目录（应用缓存、SDK 目录）
+                if not include_hidden and n.startswith("."):
+                    continue
+                full = cur / n
+                try:
+                    resolved = full.resolve()
+                except OSError:
+                    continue
+                if _under(resolved, skip_set) or _under(resolved, ignore_set):
+                    continue
+                kept.append(n)
+            dirnames[:] = kept
+
             for name in filenames:
+                if not include_hidden and name.startswith("."):
+                    continue
                 p = cur / name
                 if p in seen:
                     continue
@@ -677,8 +731,11 @@ class Engine:
                 fh.write(line + "\n")
 
 
-def clean_empty_dirs(dirs: Iterable[Path], dry_run: bool) -> list[Path]:
-    """自底向上删除空目录"""
+def clean_empty_dirs(dirs: Iterable[Path], dry_run: bool,
+                     ignores: Iterable[Path] = (),
+                     include_hidden: bool = False) -> list[Path]:
+    """自底向上删除空目录，默认跳过隐藏目录和 ignore 目录"""
+    ignore_set = [p.resolve() for p in ignores if p]
     removed: list[Path] = []
     for d in dirs:
         if not d.is_dir():
@@ -686,6 +743,19 @@ def clean_empty_dirs(dirs: Iterable[Path], dry_run: bool) -> list[Path]:
         for cur, dirnames, filenames in os.walk(d, topdown=False):
             p = Path(cur)
             if p == d:
+                continue
+            try:
+                rel = p.relative_to(d)
+            except ValueError:
+                continue
+            # 隐藏目录及其子目录一律不碰
+            if not include_hidden and any(part.startswith(".") for part in rel.parts):
+                continue
+            try:
+                resolved = p.resolve()
+            except OSError:
+                continue
+            if _under(resolved, ignore_set):
                 continue
             try:
                 if not any(p.iterdir()):

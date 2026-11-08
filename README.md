@@ -45,6 +45,7 @@
 
 ```conf
 <源目录>                    # 0 缩进，可多行
+ignore: <路径>              # 0 缩进，全局忽略目录，可多行
     <目标目录>              # 4 缩进，裸路径 / 开头
     <通配符>                # 4 缩进，裸行 = 通配符匹配
     match: <正则>           # 4 缩进
@@ -191,6 +192,25 @@
 - 想恢复就把这行删掉或改成 `skip: false`
 
 > 为什么不用 `pass`：裸行是通配符，`pass` 会被当成「文件名含 pass」的匹配条件。带冒号的 `skip:` 不会和通配符冲突。
+
+### 3.7 全局忽略目录 `ignore:`
+
+顶格书写，作用于**所有规则块**：这些目录既不扫描，也不参与 `clean` 清理。
+
+```conf
+ignore: /Pictures/.gs
+ignore: /Download/.csj
+ignore: /DCIM/*/thumbnails
+```
+
+- 可写多行，每行一个
+- 支持通配符
+- 路径同样相对 `/storage/emulated/0`
+- 写的是目录，其下所有子目录和文件一并跳过
+
+**默认已经跳过 `.` 开头的隐藏目录**，所以 `ignore:` 主要用来排除普通名字的目录，比如相机 RAW、手动分类的相册目录。
+
+想要连隐藏目录一起处理，运行时加 `--include-hidden`。
 
 ---
 
@@ -427,6 +447,7 @@ python tasker_file_tidy.py --verbose      # 输出详细日志
 | `--root` | 覆盖存储根 `/storage/emulated/0`（测试用） |
 | `--verbose` / `-v` | 输出详细日志 |
 | `--no-notify` | 不推送 Termux 通知 |
+| `--include-hidden` | 也处理 `.` 开头的隐藏目录（默认跳过） |
 
 ### 状态文件
 
