@@ -4,7 +4,7 @@
 
 用一个纯文本配置描述「把哪个目录里、名字符合什么条件的文件，移动到哪个目录，要不要改名」。
 
-> 当前状态：**语法 v2 已定稿，配置已迁移，主程序与检查器待适配**。
+> 当前状态：**v2 语法已实现**，配置、解析器、执行器、检查器、单元测试齐全。
 
 ---
 
@@ -12,9 +12,11 @@
 
 | 文件 | 作用 |
 |---|---|
-| `tasker_file_tify.conf` | 正式配置（**已迁移到 v2 语法**） |
-| `tasker_file_tify.py` | 解释器（待实现） |
-| `check_conf.py` | 语法检查器（**当前仍是 v1 版，v2 适配待做**） |
+| `tasker_file_tify.conf` | 配置，人工维护 |
+| `tidy_core.py` | 解析器 + 匹配器 + 执行器 |
+| `tasker_file_tidy.py` | 命令行入口 |
+| `check_conf.py` | 语法检查器，复用 `tidy_core` |
+| `tests/test_core.py` | 单元测试与端到端样本 |
 | `README.md` | 本文件，v2 语法规范 |
 
 ---
@@ -406,7 +408,54 @@ action: rename
 
 ---
 
-## 九、从 v1 迁移
+## 九、运行与调试
+
+```bash
+python tasker_file_tidy.py --dry-run      # 预览，不动文件
+python tasker_file_tidy.py                # 真正执行
+python tasker_file_tidy.py --only 3       # 只跑第 3 个规则块
+python tasker_file_tidy.py --undo         # 撤销上一次运行
+python tasker_file_tidy.py --verbose      # 输出详细日志
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--config` / `-c` | 配置文件路径，默认同目录下的 `tasker_file_tify.conf` |
+| `--dry-run` / `-n` | 只打印「源 → 目标」，不落盘 |
+| `--undo` | 按 `undo.log` 反向恢复 |
+| `--only N` | 只跑第 N 个规则块 |
+| `--root` | 覆盖存储根 `/storage/emulated/0`（测试用） |
+| `--verbose` / `-v` | 输出详细日志 |
+| `--no-notify` | 不推送 Termux 通知 |
+
+### 状态文件
+
+| 内容 | 位置 |
+|---|---|
+| 日志 | `~/.local/state/file_tidy/tidy_YYYYMMDD.log` |
+| 撤销记录 | `~/.local/state/file_tidy/undo.log` |
+
+可用环境变量 `FILE_TIDY_STATE` 指定其它目录。
+
+### 匹配优先级
+
+一个文件可能同时落在多个块的源目录里（例如 `/Pictures` 和 `/Pictures/Screenshots`）。规则是：
+
+1. **源目录越深越优先**
+2. 同深度按配置文件行号
+
+所以 `/Pictures/Screenshots` 的规则一定先于 `/Pictures` 的规则命中，不会被笼统规则抢走。
+
+### 安全约定
+
+- 目标同名时自动加 ` (1)`，绝不覆盖
+- 单文件失败记日志后继续，不中断整批
+- `--dry-run` 与实际执行走同一套代码，只在最后一步分叉
+- 每次移动都写 undo 记录，`--undo` 可以反悔
+
+---
+
+## 十、从 v1 迁移
 
 旧配置用的是 v1 语法，主要差异：
 
@@ -425,7 +474,7 @@ action: rename
 
 ---
 
-## 十、Termux 定时运行
+## 十一、Termux 定时运行
 
 ```bash
 pkg install python termux-api
