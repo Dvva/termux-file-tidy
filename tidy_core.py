@@ -136,10 +136,10 @@ ACTION_PARAMS = {
     "clean": set(),
 }
 
-KNOWN_VARS = {"name", "ext", "full", "dir", "mtime", "ctime", "atime",
+KNOWN_VARS = {"name", "ext", "full", "dir", "mtime", "ctime", "atime", "btime",
               "now", "date", "timestamp", "index", "count", "hash"}
 
-VAR_WITH_ARG = {"mtime", "ctime", "atime", "now", "date", "index", "hash"}
+VAR_WITH_ARG = {"mtime", "ctime", "atime", "btime", "now", "date", "index", "hash"}
 
 # 动作参数里允许写模板变量的键
 TEMPLATE_KEYS = {"to", "text", "file", "cmd"}
@@ -496,7 +496,23 @@ def scan(dirs: Iterable[Path], skip: Iterable[Path],
 
 
 def _fmt_time(ts: float, fmt: str) -> str:
+    # %s 表示 Unix 秒级时间戳，各平台 strftime 支持不一致，这里直接算
+    if fmt == "%s":
+        return str(int(ts))
     return datetime.fromtimestamp(ts).strftime(fmt or "%Y%m%d")
+
+
+def _birth_time(st: os.stat_result) -> float:
+    """
+    取文件创建时间。
+
+    Linux / Android 多数文件系统不提供 birthtime，拿不到时回退到 mtime，
+    保证模板变量始终有值，不会因为缺字段报错。
+    """
+    bt = getattr(st, "st_birthtime", None)
+    if bt:
+        return float(bt)
+    return float(st.st_mtime)
 
 
 def _var_dir(ctx: FileRef, arg: str) -> str:
@@ -530,9 +546,10 @@ VARS: dict[str, Callable[[FileRef, str], str]] = {
     "mtime": lambda c, a: _fmt_time(c.stat.st_mtime, a),
     "ctime": lambda c, a: _fmt_time(c.stat.st_ctime, a),
     "atime": lambda c, a: _fmt_time(c.stat.st_atime, a),
+    "btime": lambda c, a: _fmt_time(_birth_time(c.stat), a),
     "now": lambda c, a: _fmt_time(time.time(), a),
     "date": lambda c, a: _fmt_time(c.stat.st_mtime, a),
-    "timestamp": lambda c, a: str(int(c.stat.st_mtime)),
+    "timestamp": lambda c, a: str(int(c.stat.st_mtime * 1000)),
     "index": _var_index,
     "count": lambda c, a: str(c.total),
     "hash": _var_hash,

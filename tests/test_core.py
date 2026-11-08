@@ -161,6 +161,31 @@ class TestRender(unittest.TestCase):
             self.assertEqual(render("{count}", ref), "10")
             self.assertRegex(render("{mtime:%Y}", ref), r"^\d{4}$")
 
+    def test_timestamp_is_milliseconds(self):
+        """{timestamp} 是毫秒级，13 位数字"""
+        from tidy_core import FileRef
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.jpg"
+            p.write_text("x")
+            ref = FileRef(path=p, stat=p.stat())
+            ts = render("{timestamp}", ref)
+            self.assertTrue(ts.isdigit())
+            self.assertGreaterEqual(len(ts), 13)
+
+    def test_btime(self):
+        """创建时间：系统不支持时回退 mtime，且 %s 返回 Unix 秒"""
+        from tidy_core import FileRef
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.jpg"
+            p.write_text("x")
+            ref = FileRef(path=p, stat=p.stat())
+
+            self.assertRegex(render("{btime:%Y}", ref), r"^\d{4}$")
+            epoch = render("{btime:%s}", ref)
+            self.assertTrue(epoch.isdigit())
+            # 没有 birthtime 时应与 mtime 一致
+            self.assertEqual(epoch, render("{mtime:%s}", ref))
+
     def test_quote_for_command(self):
         """command 里的路径要加引号，否则文件名空格会被 shell 拆开"""
         from tidy_core import FileRef
