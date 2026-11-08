@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -531,13 +532,17 @@ VARS: dict[str, Callable[[FileRef, str], str]] = {
 }
 
 
-def render(template: str, ctx: FileRef) -> str:
-    """把 {name} 这类模板替换成实际值；{} 代表文件完整路径"""
+def render(template: str, ctx: FileRef, quote: bool = False) -> str:
+    """把 {name} 这类模板替换成实际值；{} 代表文件完整路径
+
+    quote=True 时给路径加 shell 引号，供 command 使用，
+    避免文件名里的空格、括号被 shell 拆开。
+    """
 
     def repl(m: re.Match) -> str:
         body = m.group(1)
         if body == "":
-            return str(ctx.path)
+            return shlex.quote(str(ctx.path)) if quote else str(ctx.path)
         name, _, arg = body.partition(":")
         fn = VARS.get(name.lower())
         if fn is None:
@@ -680,7 +685,8 @@ class Engine:
                         dest_dir = p.parent
                         name = p.name
             elif action.name == "command":
-                command = render(action.get("cmd"), f)
+                # command 里的路径要加 shell 引号，文件名常含空格和括号
+                command = render(action.get("cmd"), f, quote=True)
             elif action.name == "append":
                 append_text = render(action.get("text"), f)
                 append_file = render(action.get("file"), f)

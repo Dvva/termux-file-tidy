@@ -143,6 +143,22 @@ class TestRender(unittest.TestCase):
             self.assertEqual(render("{count}", ref), "10")
             self.assertRegex(render("{mtime:%Y}", ref), r"^\d{4}$")
 
+    def test_quote_for_command(self):
+        """command 里的路径要加引号，否则文件名空格会被 shell 拆开"""
+        from tidy_core import FileRef
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "有 空格 的 文件.mp4"
+            p.write_text("x")
+            ref = FileRef(path=p, stat=p.stat())
+
+            plain = render("cmd {}", ref)
+            quoted = render("cmd {}", ref, quote=True)
+
+            self.assertIn("有 空格 的 文件.mp4", plain)
+            self.assertNotIn("'", plain)
+            self.assertIn("'", quoted)
+            self.assertIn("有 空格 的 文件.mp4", quoted)
+
 
 class TestEngine(unittest.TestCase):
     def test_move_and_rename(self):
