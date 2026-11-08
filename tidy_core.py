@@ -385,13 +385,20 @@ def wildcard_match(name: str, pattern: str) -> bool:
 
 
 def match_block(block: Block, name: str) -> bool:
-    """判断文件名是否命中这个块的条件"""
-    if block.patterns:
-        if not any(wildcard_match(name, p) for p in block.patterns):
+    """
+    判断文件名是否命中这个块的条件。
+
+    裸行通配符和 match: 正则合在一起，统一是「或」关系：
+    任意一条命中就算匹配，不会因为另一组没命中而被否决。
+    """
+    has_condition = bool(block.patterns or block.regexes)
+    if has_condition:
+        hit = any(wildcard_match(name, p) for p in block.patterns)
+        if not hit:
+            hit = any(re.search(p, name) for p, _ in block.regexes)
+        if not hit:
             return False
-    if block.regexes:
-        if not any(re.search(p, name) for p, _ in block.regexes):
-            return False
+
     for p in block.excludes:
         if wildcard_match(name, p):
             return False

@@ -112,7 +112,7 @@ class TestMatch(unittest.TestCase):
 
     def test_block_conditions(self):
         blocks, _, _ = parse(
-            "/A\n    /x\n    *.jpg\n    match: ^IMG_[0-9]+\n    - *skip*\n"
+            "/A\n    /x\n    *.jpg\n    - *skip*\n"
         )
         b = blocks[0]
         self.assertTrue(match_block(b, "IMG_001.jpg"))
@@ -125,6 +125,24 @@ class TestMatch(unittest.TestCase):
         self.assertTrue(match_block(b, "xxaaaxx"))
         self.assertTrue(match_block(b, "bbb"))
         self.assertFalse(match_block(b, "ccc"))
+
+    def test_wildcard_and_regex_are_or(self):
+        """裸行和 match: 混用时，任一条命中即可，不能 AND"""
+        blocks, _, _ = parse(
+            "/A\n"
+            "    /x\n"
+            "    com.xingin.xhs\n"
+            "    match: Camera_1040g[0-9a-z]{20,}\n"
+            "    match: Camera_XHS_[0-9]{14}\\.\n"
+        )
+        b = blocks[0]
+        # 只命中裸行
+        self.assertTrue(match_block(b, "Screenshot_com.xingin.xhs.jpg"))
+        # 只命中 match: 正则
+        self.assertTrue(match_block(b, "Camera_1040g0k031v5pbchj40005pb9g60864ons.jpg"))
+        self.assertTrue(match_block(b, "Camera_XHS_17767757733131.jpg"))
+        # 都不命中
+        self.assertFalse(match_block(b, "IMG_20260101_123456.jpg"))
 
 
 class TestRender(unittest.TestCase):
