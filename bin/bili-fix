@@ -43,11 +43,8 @@ API = "https://api.bilibili.com/x/web-interface/view?bvid={}"
 
 BV_RE = re.compile(r"BV[0-9A-Za-z]{10}", re.IGNORECASE)
 
-STATE_DIR = Path(os.environ.get(
-    "FILE_TIDY_STATE",
-    str(Path.home() / ".local" / "state" / "file_tidy"),
-))
-DEFAULT_RECORD = STATE_DIR / "bili-downloads.tsv"
+# 记录文件名固定，放在视频所在目录下
+RECORD_NAME = "bili-downloads.tsv"
 
 # 文件名里不能出现的字符
 ILLEGAL = re.compile(r'[\\/:*?"<>|\r\n\t]')
@@ -264,8 +261,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="给 B 站下载的视频嵌入封面并记录 BV 号")
     ap.add_argument("video", help="视频文件路径")
     ap.add_argument("--no-cover", action="store_true", help="不写封面")
-    ap.add_argument("--record", default=str(DEFAULT_RECORD),
-                    help=f"记录文件，默认 {DEFAULT_RECORD}")
+    ap.add_argument("--record", default=None,
+                    help=f"记录文件，默认放在视频同目录的 {RECORD_NAME}")
     ap.add_argument("--no-record", action="store_true", help="不写记录")
     ap.add_argument("--dry-run", "-n", action="store_true", help="只打印，不动文件")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -276,7 +273,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[错误] 找不到文件：{video}", file=sys.stderr)
         return 2
 
-    record = None if args.no_record else Path(args.record).expanduser()
+    if args.no_record:
+        record = None
+    elif args.record:
+        record = Path(args.record).expanduser()
+    else:
+        # 默认写在视频所在目录，和视频放一起
+        record = video.parent / RECORD_NAME
 
     return process(
         video,
