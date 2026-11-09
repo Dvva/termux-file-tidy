@@ -22,11 +22,14 @@ from datetime import datetime
 from pathlib import Path
 
 from tidy_core import (
+    COMPRESS_ACTIONS,
     DEFAULT_ROOT,
     ERROR,
     Engine,
     attach_sources,
     clean_empty_dirs,
+    compress_file,
+    dedupe_block,
     expand_ignores,
     match_block,
     owner_blocks,
@@ -162,14 +165,53 @@ def run(args: argparse.Namespace) -> int:
     processed: set[Path] = set()
     moved = failed = 0
 
+    # 块级去重先跑：重复文件先归位，再让其他规则处理剩下的
+    dedupe_moved = 0
+    for b in active:
+        if not any(a.name == "dedupe" for a in b.actions):
+            continue
+        groups, n, records = dedupe_block(
+            b, root, args.dry_run, ignore_dirs, args.include_hidden)
+        if groups:
+            log.info("去重：%d 组重复，移动 %d 个", groups, n)
+        dedupe_moved += n
+        if args.dry_run:
+            for rec in records:
+                _, src, dst = rec.split("\t")
+                print(f"{src}  ->  {dst}（重复）")
+        engine.undo_lines.extend(records)
+
+    compressed = 0
+    compress_skipped = 0
+
     for f in files:
         if f.path in processed:
             continue
         for b in owner_blocks(active, f.path):
-            if b.clean:
+            # clean 块只负责收尾清空目录；dedupe 块已在上面整块处理
+            if b.clean or any(a.name == "dedupe" for a in b.actions):
                 continue
             if not match_block(b, f.path.name):
                 continue
+            # 压缩是原地操作，不走 plan 的 src -> dst 流程
+            comp = next((a for a in b.actions if a.name in COMPRESS_ACTIONS), None)
+            if comp is not None:
+                processed.add(f.path)
+                status, msg = compress_file(f.path, comp, args.dry_run)
+                if status == "ok":
+                    compressed += 1
+                    if args.dry_run:
+                        print(f"{f.path}  ->  {msg}")
+                    else:
+                        log.info("压缩 %s：%s", f.path, msg)
+                elif status == "skip":
+                    # 格式不支持 / 压完没变小：不算失败，只记日志
+                    compress_skipped += 1
+                    log.info("跳过压缩 %s：%s", f.path, msg)
+                else:
+                    failed += 1
+                    log.error("压缩失败 %s：%s", f.path, msg)
+                break
             plan = engine.plan(b, f)
             if plan is None:
                 break
@@ -193,7 +235,8 @@ def run(args: argparse.Namespace) -> int:
     engine.save_undo()
 
     summary = (f"处理 {moved} 个，失败 {failed} 个，"
-               f"清理空目录 {len(removed)} 个")
+               f"压缩 {compressed} 个（跳过 {compress_skipped}），"
+               f"去重 {dedupe_moved} 个，清理空目录 {len(removed)} 个")
     print(summary)
     if args.dry_run:
         print("（dry-run，未改动任何文件）")

@@ -125,7 +125,8 @@ class Result:
 # 解析器
 # ============================================================
 
-ACTION_NAMES = {"move", "copy", "rename", "command", "append", "clean"}
+ACTION_NAMES = {"move", "copy", "rename", "command", "append", "clean",
+                "dedupe", "compress-image", "compress-music"}
 
 # 每个动作允许的参数（match 对所有动作都可用）
 ACTION_PARAMS = {
@@ -136,7 +137,16 @@ ACTION_PARAMS = {
     "command": {"cmd"},
     "append": {"text", "file"},
     "clean": set(),
+    # 去重：keep 是主目录，重复时保留这里的那份，可写多行按顺序优先
+    "dedupe": {"keep"},
+    # 压缩图片：quality 是 jpg 质量刻度；max_edge 不写 = 不改尺寸
+    "compress-image": {"quality", "max_edge"},
+    # 压缩音乐：format 目标格式，bitrate 码率
+    "compress-music": {"format", "bitrate", "quality"},
 }
+
+# 原地操作的动作（不产生 src -> dst 移动），走单独的压缩分支
+COMPRESS_ACTIONS = {"compress-image", "compress-music"}
 
 KNOWN_VARS = {"name", "ext", "full", "dir", "mtime", "ctime", "atime", "btime",
               "now", "date", "timestamp", "index", "count", "hash", "rand"}
@@ -338,7 +348,8 @@ def expand_sources(sources: Iterable[str], root: Path) -> list[Path]:
             if p.is_dir():
                 out.append(p)
             else:
-                log.warning("源目录不存在：%s", p)
+                # 配置里引用了手机上已不存在的目录：只写日志，不刷终端
+                log.debug("源目录不存在：%s", p)
     return out
 
 
@@ -859,6 +870,180 @@ def clean_empty_dirs(dirs: Iterable[Path], dry_run: bool,
             except OSError:
                 pass
     return removed
+
+
+# ============================================================
+# 去重
+# ============================================================
+
+
+def _sha256(path: Path) -> str:
+    """算文件内容哈希，分块读取，避免大文件吃内存"""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dedupe_block(block: Block, root: Path, dry_run: bool,
+                 ignores: Iterable[Path] = (),
+                 include_hidden: bool = False,
+                 dest_root: Path | None = None) -> tuple[int, int, list[str]]:
+    """对一个块做去重，返回 (重复组数, 移动文件数, undo 记录)
+
+    判定标准是「同名 + 同大小 + 同哈希」，三者全中才算重复，
+    避免把同名不同版本的书写成重复。保留 keep 目录下的那份，
+    keep 没写或都不在时按路径排序保留第一个。
+    """
+    keep: list[Path] = []
+    for a in block.actions:
+        if a.name == "dedupe":
+            keep.extend(to_real(v, root) for v in a.all("keep"))
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    base = dest_root or (root / "_重复文件" / stamp)
+    # 已经搬走的重复文件不再参与比较，否则重复目录会越滚越大
+    files = scan(block.dirs, [base], ignores, include_hidden)
+    if not files:
+        return 0, 0, []
+
+    groups: dict[tuple[str, int], list[Path]] = {}
+    for f in files:
+        groups.setdefault((f.path.name.lower(), f.stat.st_size), []).append(f.path)
+
+    dup_groups = 0
+    records: list[str] = []
+    planned: set[str] = set()
+    for paths in groups.values():
+        if len(paths) < 2:
+            continue
+        by_hash: dict[str, list[Path]] = {}
+        for p in paths:
+            try:
+                by_hash.setdefault(_sha256(p), []).append(p)
+            except OSError as exc:
+                log.warning("读取失败 %s：%s", p, exc)
+        for same in by_hash.values():
+            if len(same) < 2:
+                continue
+            dup_groups += 1
+            same.sort(key=lambda p: (0 if _under(p, keep) else 1, str(p)))
+            for p in same[1:]:
+                try:
+                    rel = p.relative_to(root)
+                except ValueError:
+                    rel = Path(p.name)
+                dst = base / rel
+                n = 1
+                while str(dst) in planned:
+                    dst = base / rel.with_name(f"{rel.stem} ({n}){rel.suffix}")
+                    n += 1
+                planned.add(str(dst))
+                if not dry_run:
+                    try:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(p), str(dst))
+                    except OSError as exc:
+                        log.error("移动失败 %s：%s", p, exc)
+                        continue
+                records.append(f"move\t{p}\t{dst}")
+    return dup_groups, len(records), records
+
+
+# ============================================================
+# 压缩
+# ============================================================
+
+
+def _human_size(n: int) -> str:
+    """字节数转可读单位，小文件别显示成 0.0 MB"""
+    if n >= 1048576:
+        return f"{n / 1048576:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
+
+
+def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[str, str]:
+    """按 compress-image / compress-music 压缩单个文件并原地替换
+
+    - 默认只降清晰度、不动尺寸；写了 max_edge 才等比缩小
+    - 压缩后体积没变小就保留原文件，不算失败
+    - 返回 (状态, 说明)：ok 已替换 / skip 无需或不能压，原文件未动 / fail 出错
+    """
+    ff = shutil.which("ffmpeg")
+    if ff is None:
+        return "fail", "找不到 ffmpeg（pkg install ffmpeg）"
+
+    before = path.stat().st_size
+    ext = path.suffix.lower()
+
+    if action.name == "compress-image":
+        quality = action.get("quality", "4").strip() or "4"
+        max_edge = action.get("max_edge", "").strip()
+        tmp = path.with_name(f".{path.stem}.tidy-tmp{ext}")
+        cmd = [ff, "-y", "-loglevel", "error", "-i", str(path)]
+        if max_edge and max_edge != "0":
+            cmd += ["-vf",
+                    f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
+                    f":force_original_aspect_ratio=decrease"]
+        if ext in (".jpg", ".jpeg"):
+            cmd += ["-q:v", quality]
+        elif ext == ".png":
+            # png 是无损格式，没有质量刻度，只做最大压缩
+            cmd += ["-compression_level", "9"]
+        else:
+            # gif / webp 先不碰：动图转码容易把动画弄坏
+            return "skip", f"不支持的图片格式：{ext or '无扩展名'}"
+        cmd.append(str(tmp))
+        target = path
+    else:
+        fmt = (action.get("format", "mp3") or "mp3").strip().lower()
+        bitrate = (action.get("bitrate", "320k") or "320k").strip()
+        codec = {"mp3": "libmp3lame", "aac": "aac", "opus": "libopus"}.get(fmt)
+        if codec is None:
+            return "skip", f"不支持的音频格式：{fmt}"
+        tmp = path.with_name(f".{path.stem}.tidy-tmp.{fmt}")
+        cmd = [ff, "-y", "-loglevel", "error", "-i", str(path),
+               "-c:a", codec, "-b:a", bitrate, str(tmp)]
+        target = path if ext == f".{fmt}" else path.with_suffix(f".{fmt}")
+
+    if dry_run:
+        return "ok", f"将压缩（当前 {_human_size(before)}）"
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as exc:
+        tmp.unlink(missing_ok=True)
+        return "fail", str(exc)
+
+    if proc.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        return "fail", (lines[-1][:200] if lines else f"ffmpeg 退出码 {proc.returncode}")
+
+    try:
+        after = tmp.stat().st_size
+    except OSError:
+        return "fail", "临时文件不见了"
+
+    if after >= before:
+        tmp.unlink(missing_ok=True)
+        return "skip", f"压完没变小，保留原文件（{_human_size(before)}）"
+
+    try:
+        tmp.replace(target)
+        # 格式变了（如 wav -> mp3）时，原来的文件要删掉，
+        # 顺序放在 replace 之后，万一替换失败原文件还在
+        if target != path:
+            path.unlink(missing_ok=True)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        return "fail", str(exc)
+
+    return "ok", (f"{_human_size(before)} -> {_human_size(after)}，"
+                  f"省 {_human_size(before - after)}")
 
 
 def undo(undo_path: Path, dry_run: bool = False) -> tuple[int, int]:
