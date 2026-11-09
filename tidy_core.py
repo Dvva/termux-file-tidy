@@ -126,7 +126,7 @@ class Result:
 # ============================================================
 
 ACTION_NAMES = {"move", "copy", "rename", "command", "append", "clean",
-                "dedupe", "compress-image", "compress-music"}
+                "dedupe", "compress-image", "compress-music", "compress-video"}
 
 # 每个动作允许的参数（match 对所有动作都可用）
 ACTION_PARAMS = {
@@ -143,10 +143,12 @@ ACTION_PARAMS = {
     "compress-image": {"quality", "max_edge"},
     # 压缩音乐：format 目标格式，bitrate 码率
     "compress-music": {"format", "bitrate", "quality"},
+    # 压缩视频：height 是短边上限（1080p 写 1080），max_edge 是长边上限
+    "compress-video": {"max_edge", "height", "crf", "preset"},
 }
 
 # 原地操作的动作（不产生 src -> dst 移动），走单独的压缩分支
-COMPRESS_ACTIONS = {"compress-image", "compress-music"}
+COMPRESS_ACTIONS = {"compress-image", "compress-music", "compress-video"}
 
 KNOWN_VARS = {"name", "ext", "full", "dir", "mtime", "ctime", "atime", "btime",
               "now", "date", "timestamp", "index", "count", "hash", "rand"}
@@ -998,6 +1000,36 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
             return "skip", f"不支持的图片格式：{ext or '无扩展名'}"
         cmd.append(str(tmp))
         target = path
+        timeout = 600
+    elif action.name == "compress-video":
+        video_exts = (".mp4", ".mkv", ".mov", ".avi", ".webm",
+                      ".ts", ".m4v", ".flv", ".wmv", ".3gp")
+        if ext not in video_exts:
+            return "skip", f"不支持的视频格式：{ext or '无扩展名'}"
+        max_edge = action.get("max_edge", "").strip()
+        height = action.get("height", "").strip()
+        crf = action.get("crf", "23").strip() or "23"
+        preset = action.get("preset", "veryfast").strip() or "veryfast"
+        tmp = path.with_name(f".{path.stem}.tidy-tmp.mp4")
+        if height:
+            # 短边上限：横屏按高算、竖屏按宽算，1920x1080 写 1080 就保持 1080p
+            vf = (f"scale='if(gt(iw,ih),-2,min(iw,{height}))':"
+                  f"'if(gt(iw,ih),min(ih,{height}),-2)'")
+        elif max_edge:
+            vf = (f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
+                  f":force_original_aspect_ratio=decrease:force_divisible_by=2")
+        else:
+            vf = ("scale='if(gt(iw,ih),-2,min(iw,1080))':"
+                  "'if(gt(iw,ih),min(ih,1080),-2)'")
+        cmd = [
+            ff, "-y", "-loglevel", "error", "-i", str(path),
+            "-vf", vf,
+            "-c:v", "libx264", "-crf", crf, "-preset", preset,
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", str(tmp),
+        ]
+        target = path if ext == ".mp4" else path.with_suffix(".mp4")
+        timeout = 3600  # 视频慢，给足一小时
     else:
         fmt = (action.get("format", "mp3") or "mp3").strip().lower()
         bitrate = (action.get("bitrate", "320k") or "320k").strip()
@@ -1008,12 +1040,13 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
         cmd = [ff, "-y", "-loglevel", "error", "-i", str(path),
                "-c:a", codec, "-b:a", bitrate, str(tmp)]
         target = path if ext == f".{fmt}" else path.with_suffix(f".{fmt}")
+        timeout = 600
 
     if dry_run:
         return "ok", f"将压缩（当前 {_human_size(before)}）"
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         tmp.unlink(missing_ok=True)
         return "fail", str(exc)
