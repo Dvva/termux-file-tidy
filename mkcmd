@@ -1,0 +1,69 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# mkcmd - 把 tidy 注册成终端命令 tify
+#
+# 按 Termux 命令注册规范（docs/rules/10-Termux与安卓.md）：
+#   - 命令放 ~/bin，不放 $PREFIX/bin
+#   - 写 bash 包装，业务逻辑留在 .py
+#   - 包装里写绝对路径，自己带 PATH 和环境变量
+#   - ~/bin 通过 ~/.bashrc 加入 PATH（只加一次）
+#
+# 用法：
+#   bash mkcmd              安装 / 覆盖
+#   bash mkcmd --remove     移除
+#   bash mkcmd --list       查看当前状态
+
+set -eu
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+TARGET="$DIR/tasker_file_tidy.py"
+BIN_DIR="$HOME/bin"
+CMD="$BIN_DIR/tify"
+BASHRC="$HOME/.bashrc"
+
+die() { echo "[错误] $*" >&2; exit 1; }
+
+case "${1:-}" in
+    --remove)
+        rm -f "$CMD"
+        echo "已移除 $CMD"
+        exit 0
+        ;;
+    --list)
+        if [ -f "$CMD" ]; then
+            echo "已注册：$CMD"
+            grep -n 'HOME/bin' "$BASHRC" 2>/dev/null || echo "（~/.bashrc 里没有 ~/bin 的 PATH）"
+        else
+            echo "未注册"
+        fi
+        exit 0
+        ;;
+esac
+
+[ -f "$TARGET" ] || die "找不到主脚本：$TARGET"
+
+mkdir -p "$BIN_DIR"
+
+# 包装脚本：只做转发，参数与退出码透传
+cat > "$CMD" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+# tify - termux-file-tidy 文件分类
+set -eu
+export PATH="/data/data/com.termux/files/usr/bin:/system/bin:/system/xbin:\$HOME/bin:\$PATH"
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+exec /data/data/com.termux/files/usr/bin/python3 "$TARGET" "\$@"
+EOF
+
+chmod +x "$CMD"
+
+# ~/.bashrc 里补 PATH，只加一次
+if ! grep -q 'HOME/bin' "$BASHRC" 2>/dev/null; then
+    {
+        echo ''
+        echo '# termux-file-tidy 的命令目录'
+        echo 'export PATH="$HOME/bin:$PATH"'
+    } >> "$BASHRC"
+    echo "已把 ~/bin 加入 ~/.bashrc 的 PATH"
+fi
+
+echo "已注册：$CMD"
+echo "新开终端或执行  source ~/.bashrc  之后就能用 tify"

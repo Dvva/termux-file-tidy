@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/python3
 # -*- coding: utf-8 -*-
 """
 termux-file-tidy 命令行入口

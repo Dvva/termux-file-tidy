@@ -16,6 +16,8 @@
 | `tidy_core.py` | 解析器 + 匹配器 + 执行器 |
 | `tasker_file_tidy.py` | 命令行入口 |
 | `check_conf.py` | 语法检查器，复用 `tidy_core` |
+| `mkcmd` | 把入口注册成终端命令 `tify`（`~/bin` + 包装） |
+| `install.sh` | 注册 / 取消每日定时任务 |
 | `tests/test_core.py` | 单元测试与端到端样本 |
 | `README.md` | 本文件，v2 语法规范 |
 
@@ -454,6 +456,35 @@ action: rename
 ---
 
 ## 九、运行与调试
+
+### 注册终端命令 `tify`
+
+按 Termux 的约定，命令放 `~/bin`，由 bash 包装转发，不碰 `$PREFIX/bin`、不写 alias。
+
+```bash
+bash ~/termux-file-tidy/mkcmd          # 安装
+source ~/.bashrc                       # 或者新开一个终端
+tify --help
+```
+
+之后在任何目录都能直接用：
+
+```bash
+tify -n      # 预览
+tify         # 执行
+```
+
+`mkcmd` 会做三件事：建 `~/bin`、写包装 `~/bin/tify`、往 `~/.bashrc` 补一行 `export PATH="$HOME/bin:$PATH"`（已存在则跳过）。
+
+| 参数 | 说明 |
+|---|---|
+| 无 | 安装 / 覆盖 |
+| `--remove` | 删除 `~/bin/tify` |
+| `--list` | 查看是否已注册 |
+
+包装只做转发，真正的逻辑仍在 `tasker_file_tidy.py`，所以改脚本不需要重装命令。
+
+### 直接运行
 
 ```bash
 python tasker_file_tidy.py --dry-run      # 预览，不动文件
