@@ -298,7 +298,7 @@ ignore: /DCIM/*/thumbnails
 - `limit: N` 只在**定时任务**（`--scheduled`）里生效：本次最多压 N 个，剩下的下次接着做
 
 ```conf
-# 图片：quality 1-31，数字越大压得越狠（jpg 用 -q:v，png 直接拉满压缩级别）
+# 图片：quality 1-31，数字越大压得越狠
 /__我的文件/同人图*
     action: compress-image
         quality: 5
@@ -324,6 +324,7 @@ ignore: /DCIM/*/thumbnails
 |---|---|---|
 | `quality:` | image | jpg 质量刻度 1-31，越大越糊、越小越清晰 |
 | `max_edge:` | image / video | 长边上限，等比缩小；不写就不动尺寸 |
+| `flatten:` | image | `true`（默认）：带透明通道的 png 垫白底转成 jpg |
 | `resolution:` | video | 视频网站档位：`1080p` / `720p` / `480p` / `4k`，按**短边**算 |
 | `height:` | video | 同 `resolution`，直接写数值，如 `1080` |
 | `crf:` | video | 18-28 常用，越大越糊 |
@@ -332,6 +333,26 @@ ignore: /DCIM/*/thumbnails
 | `bitrate:` | music | 如 `320k` |
 | `limit:` | 全部压缩 | 定时任务单次配额 |
 | `preserve_time:` | 全部压缩 | `true`（默认）/ `false`，是否保留原时间戳 |
+
+### 图片压缩怎么走
+
+| 类型 | 处理 |
+|---|---|
+| `.jpg` / `.jpeg` | `-q:v quality`，尺寸不动 |
+| `.png` **带透明通道** | 垫一层白底（透明区域变白）后转成 **`.jpg`**，原 png 删除 |
+| `.png` 不带透明 | `-compression_level 6` 无损重压，格式不变 |
+| `.gif` / `.webp` | 跳过（动图转码容易把动画弄坏） |
+
+透明 png 转 jpg 的收益非常大，实测一张 5120×2880 的 RGBA 壁纸：
+
+| 方式 | 结果 | 耗时 |
+|---|---|---|
+| `-compression_level 9`（旧） | 12.1 MB → 10.5 MB（省 15%） | 50 秒 |
+| **白底转 jpg q4（默认）** | 12.1 MB → **1.5 MB**（省 87%） | **2.1 秒** |
+
+因为 png 是无损格式，`compression_level` 只影响压缩耗时，对 12 MB 的图几乎榨不出空间。想保留 png 格式就写 `flatten: false`。
+
+> 注意：转 jpg 会改文件的扩展名（`a.png` → `a.jpg`）。如果壁纸文件名有引用关系，先确认再跑。
 
 ### 视频分辨率怎么算
 

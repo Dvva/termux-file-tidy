@@ -142,8 +142,9 @@ ACTION_PARAMS = {
     # 去重：keep 是主目录，重复时保留这里的那份，可写多行按顺序优先
     "dedupe": {"keep"},
     # 压缩图片：quality 是 jpg 质量刻度；max_edge 不写 = 不改尺寸
+    # flatten 把带透明通道的 png 拍成白底 jpg（默认开）
     # limit 是单次最多压几个（定时任务用），preserve_time 是否保留原时间戳
-    "compress-image": {"quality", "max_edge", "limit", "preserve_time"},
+    "compress-image": {"quality", "max_edge", "flatten", "limit", "preserve_time"},
     # 压缩音乐：format 目标格式，bitrate 码率
     "compress-music": {"format", "bitrate", "quality", "limit", "preserve_time"},
     # 压缩视频：resolution 按视频网站口径写 1080p / 720p；height 是短边数值；
@@ -1391,6 +1392,41 @@ def video_scale_filter(action: Action) -> str | None:
     return None
 
 
+def _probe_image(path: Path) -> tuple[str, int, int]:
+    """用 ffprobe 取像素格式和宽高，返回 (pix_fmt, width, height)
+
+    拿不到就返回 ("", 0, 0)，调用方按「无透明、尺寸未知」处理。
+    """
+    fp = shutil.which("ffprobe")
+    if fp is None:
+        return "", 0, 0
+    try:
+        out = subprocess.run(
+            [fp, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt,width,height",
+             "-of", "default=noprint_wrappers=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "", 0, 0
+    info: dict[str, str] = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        info[key.strip()] = value.strip()
+    pix = info.get("pix_fmt", "").lower()
+    try:
+        width = int(info.get("width", 0))
+        height = int(info.get("height", 0))
+    except ValueError:
+        width = height = 0
+    return pix, width, height
+
+
+def _has_alpha(pix_fmt: str) -> bool:
+    """像素格式带不带 alpha 通道（rgba / ya8 / yuva420p 这类）"""
+    return "a" in (pix_fmt or "").lower()
+
+
 def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[str, str, int]:
     """按 compress-image / compress-music / compress-video 压缩单个文件并原地替换
 
@@ -1413,23 +1449,47 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
     if action.name == "compress-image":
         quality = action.get("quality", "4").strip() or "4"
         max_edge = action.get("max_edge", "").strip()
+        flatten = action.get("flatten", "true").strip().lower() != "false"
         tmp = path.with_name(f".{path.stem}{TMP_MARK}{ext}")
-        cmd = [ff, "-y", "-loglevel", "error", "-i", str(path)]
-        if max_edge and max_edge != "0":
-            cmd += ["-vf",
-                    f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
-                    f":force_original_aspect_ratio=decrease"]
+        target = path
+        timeout = 600
+
         if ext in (".jpg", ".jpeg"):
-            cmd += ["-q:v", quality]
+            cmd = [ff, "-y", "-loglevel", "error", "-i", str(path)]
+            if max_edge and max_edge != "0":
+                cmd += ["-vf",
+                        f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
+                        f":force_original_aspect_ratio=decrease"]
+            cmd += ["-q:v", quality, str(tmp)]
         elif ext == ".png":
-            # png 是无损格式，没有质量刻度，只做最大压缩
-            cmd += ["-compression_level", "9"]
+            pix, width, height = _probe_image(path)
+            if flatten and _has_alpha(pix) and width and height:
+                # 带透明通道的 png：垫一层白底再压成 jpg，
+                # 直接丢弃 alpha 会让透明区域变成黑色
+                tmp = path.with_name(f".{path.stem}{TMP_MARK}.jpg")
+                target = path.with_suffix(".jpg")
+                filters = ["[1:v][0:v]overlay=format=auto"]
+                if max_edge and max_edge != "0":
+                    filters.append(
+                        f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
+                        f":force_original_aspect_ratio=decrease")
+                cmd = [ff, "-y", "-loglevel", "error", "-i", str(path),
+                       "-f", "lavfi", "-i", f"color=c=white:s={width}x{height}",
+                       "-filter_complex", ",".join(filters),
+                       # 白底源是无限帧，不锁一帧会被当成序列输出而报错
+                       "-frames:v", "1", "-q:v", quality, str(tmp)]
+            else:
+                # 不透明的 png 是无损格式，没有质量刻度，靠 zlib 级别压；
+                # 6 比 9 快 2-3 倍，体积差 1-2%
+                cmd = [ff, "-y", "-loglevel", "error", "-i", str(path)]
+                if max_edge and max_edge != "0":
+                    cmd += ["-vf",
+                            f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
+                            f":force_original_aspect_ratio=decrease"]
+                cmd += ["-compression_level", "6", str(tmp)]
         else:
             # gif / webp 先不碰：动图转码容易把动画弄坏
             return "skip", f"不支持的图片格式：{ext or '无扩展名'}", 0
-        cmd.append(str(tmp))
-        target = path
-        timeout = 600
     elif action.name == "compress-video":
         video_exts = (".mp4", ".mkv", ".mov", ".avi", ".webm",
                       ".ts", ".m4v", ".flv", ".wmv", ".3gp")

@@ -587,6 +587,87 @@ class TestTabIndent(unittest.TestCase):
         self.assertIn("Tab", msgs)
 
 
+class TestPngFlatten(unittest.TestCase):
+    """带透明的 png 要垫白底转 jpg，不然透明区域会变黑"""
+
+    def _ff(self):
+        import shutil
+        return shutil.which("ffmpeg") or shutil.which("ffprobe")
+
+    def setUp(self):
+        if self._ff() is None:
+            self.skipTest("没有 ffmpeg")
+
+    def _make_alpha_png(self, p: Path):
+        """左半边全透明、右半边带彩色噪点（噪点让 png 足够大，转 jpg 才会变小）"""
+        import subprocess
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc2=size=400x400:rate=1",
+             "-vf", "format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)'"
+             ":a='if(lt(X,200),0,255)'",
+             "-frames:v", "1", str(p)],
+            check=True, timeout=60)
+
+    def _pixel(self, p: Path, x: int, y: int):
+        import subprocess
+        out = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(p), "-vf",
+             f"crop=1:1:{x}:{y},format=rgb24", "-f", "rawvideo", "-"],
+            capture_output=True, timeout=60).stdout
+        return tuple(out[:3])
+
+    def _action(self, extra: str = ""):
+        blocks, issues, _ = parse(
+            "/x\n    action: compress-image\n        quality: 3\n" + extra)
+        self.assertEqual([i for i in issues if i.level == "error"], [])
+        return blocks[0].actions[0]
+
+    def test_alpha_detected(self):
+        from tidy_core import _has_alpha, _probe_image
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.png"
+            self._make_alpha_png(p)
+            pix, w, h = _probe_image(p)
+            self.assertIn("a", pix)
+            self.assertEqual((w, h), (400, 400))
+            self.assertTrue(_has_alpha(pix))
+            self.assertFalse(_has_alpha("rgb24"))
+
+    def test_transparent_png_becomes_jpg_with_white_bg(self):
+        from tidy_core import compress_file
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.png"
+            self._make_alpha_png(p)
+            status, msg, _ = compress_file(p, self._action())
+            self.assertEqual(status, "ok", msg)
+
+            jpg = p.with_suffix(".jpg")
+            self.assertTrue(jpg.exists(), "透明 png 应该转成 jpg")
+            self.assertFalse(p.exists(), "原 png 应该删掉")
+
+            r, g, b = self._pixel(jpg, 5, 5)
+            self.assertGreater(r, 240)
+            self.assertGreater(g, 240)
+            self.assertGreater(b, 240)
+
+            # 右半边是不透明的彩色噪点，不应该被刷白
+            r, g, b = self._pixel(jpg, 300, 200)
+            self.assertFalse(r > 240 and g > 240 and b > 240)
+
+    def test_flatten_false_keeps_png(self):
+        from tidy_core import compress_file
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.png"
+            self._make_alpha_png(p)
+            status, msg, _ = compress_file(p, self._action("        flatten: false\n"))
+            if status == "skip":
+                self.skipTest(f"没压小：{msg}")
+            self.assertEqual(status, "ok", msg)
+            self.assertTrue(p.exists(), "关掉 flatten 就不该改格式")
+            self.assertFalse(p.with_suffix(".jpg").exists())
+
+
 class TestVideoScale(unittest.TestCase):
     """视频按视频网站口径分档：短边定档，只降不升"""
 
