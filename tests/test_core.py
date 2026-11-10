@@ -682,6 +682,86 @@ class TestPngFlatten(unittest.TestCase):
             self.assertFalse(p.with_suffix(".jpg").exists())
 
 
+class TestCompressIndex(unittest.TestCase):
+    """压缩过的文件记在目录下的 .tidy-compressed，防止重复压"""
+
+    def test_roundtrip_and_skip(self):
+        from tidy_core import CompressIndex
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f = base / "sub" / "a.jpg"
+            f.parent.mkdir()
+            f.write_bytes(b"x" * 100)
+
+            idx = CompressIndex(base, signature="sig1")
+            idx.load()
+            self.assertFalse(idx.is_done(f))
+            idx.mark(f, "ok")
+            idx.close()
+
+            idx2 = CompressIndex(base, signature="sig1")
+            idx2.load()
+            self.assertTrue(idx2.is_done(f), "大小和 mtime 没变应该跳过")
+
+    def test_recompressed_when_file_changes(self):
+        from tidy_core import CompressIndex
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f = base / "a.jpg"
+            f.write_bytes(b"x" * 100)
+
+            idx = CompressIndex(base, signature="sig1")
+            idx.load()
+            idx.mark(f, "ok")
+            idx.close()
+
+            f.write_bytes(b"y" * 200)      # 文件被换掉
+            idx2 = CompressIndex(base, signature="sig1")
+            idx2.load()
+            self.assertFalse(idx2.is_done(f), "文件变了要重新压")
+
+    def test_signature_change_invalidates(self):
+        """改了压缩参数，旧记录作废"""
+        from tidy_core import CompressIndex
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f = base / "a.mp3"
+            f.write_bytes(b"x" * 10)
+
+            idx = CompressIndex(base, signature="320k")
+            idx.load()
+            idx.mark(f, "skip")
+            idx.close()
+
+            idx2 = CompressIndex(base, signature="96k")
+            self.assertEqual(idx2.load(), 0)
+            self.assertFalse(idx2.is_done(f))
+
+    def test_fail_is_not_recorded(self):
+        from tidy_core import CompressIndex
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f = base / "a.mp3"
+            f.write_bytes(b"x" * 10)
+
+            idx = CompressIndex(base, signature="s")
+            idx.load()
+            idx.mark(f, "fail")
+            idx.close()
+            self.assertFalse(idx.path.exists(), "失败不该写记录，下次要重试")
+
+    def test_signature_differs_by_params(self):
+        from tidy_core import compress_signature
+        def sig(conf):
+            blocks, _, _ = parse("/x\n    action: compress-music\n" + conf)
+            return compress_signature(blocks[0].actions[0])
+        self.assertNotEqual(sig("        bitrate: 320k\n"),
+                            sig("        bitrate: 96k\n"))
+        self.assertEqual(sig("        bitrate: 96k\n        limit: 5\n"),
+                         sig("        bitrate: 96k\n        limit: 99\n"),
+                         "limit 是调度参数，不该影响压缩结论")
+
+
 class TestVideoScale(unittest.TestCase):
     """视频按视频网站口径分档：短边定档，只降不升"""
 

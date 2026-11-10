@@ -1207,6 +1207,118 @@ class Progress:
         self._drawn = 0
 
 
+class CompressIndex:
+    """压缩过的文件清单，存在被压缩目录下的隐藏文件 .tidy-compressed 里。
+
+    一行一条 JSON：{"p": 相对路径, "s": 压缩后大小, "m": 压缩后修改时间}
+    - 判断依据是「大小 + mtime 都没变」，所以文件被换掉、重新下载过会自动重新压缩
+    - 只记 ok 和「压完没变小」，失败的会重试
+    - 文件头一行记压缩参数的签名，参数改了（比如 bitrate 从 320k 改成 96k）
+      旧记录自动作废，不会因为「上次说压过」而永远跳过
+
+    放在目录里而不是 ~/.local/state，是为了跟着文件夹一起移动/备份/删除。
+    """
+
+    NAME = ".tidy-compressed"
+
+    def __init__(self, base: Path, signature: str = ""):
+        self.base = base
+        self.path = base / self.NAME
+        self.signature = signature
+        self.entries: dict[str, tuple[int, int]] = {}
+        self._fh = None
+        self._wrote_header = False
+
+    def load(self) -> int:
+        """读旧记录，返回有效条数"""
+        if not self.path.exists():
+            return 0
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        old_sig = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue        # 中断留下的半行
+            if "__sig" in rec:
+                old_sig = rec["__sig"]
+                continue
+            try:
+                self.entries[str(rec["p"])] = (int(rec["s"]), int(rec["m"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if old_sig != self.signature:
+            # 压缩参数变过，旧结论不再成立
+            self.entries.clear()
+            self._wrote_header = True   # 下次写入时重写签名
+            return 0
+        return len(self.entries)
+
+    def _key(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.base))
+        except ValueError:
+            return str(path)
+
+    def is_done(self, path: Path) -> bool:
+        rec = self.entries.get(self._key(path))
+        if rec is None:
+            return False
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        return rec == (st.st_size, int(st.st_mtime))
+
+    def mark(self, path: Path, result: str) -> None:
+        """记一笔；fail 不记，下次还会重试"""
+        if result not in ("ok", "skip"):
+            return
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        key = self._key(path)
+        self.entries[key] = (st.st_size, int(st.st_mtime))
+        if self._fh is None:
+            try:
+                self.base.mkdir(parents=True, exist_ok=True)
+                self._fh = self.path.open("a", encoding="utf-8")
+            except OSError as exc:
+                log.warning("无法写压缩记录 %s：%s", self.path, exc)
+                return
+            if not self._wrote_header and self.signature:
+                self._fh.write(json.dumps({"__sig": self.signature},
+                                          ensure_ascii=False) + "\n")
+                self._wrote_header = True
+        self._fh.write(json.dumps({"p": key, "s": st.st_size,
+                                   "m": int(st.st_mtime)},
+                                  ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+
+def compress_signature(action: Action) -> str:
+    """压缩参数的指纹：参数一改，目录里的旧记录就作废"""
+    params = sorted(f"{p.key}={p.value}" for p in action.params
+                    if p.key not in ("limit", "preserve_time"))
+    raw = "|".join([action.name] + params)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+
+
 def cleanup_tmp(dirs: Iterable[Path], dry_run: bool = False) -> int:
     """清掉上次中断留下的 .xxx.tidy-tmp.* 临时文件，返回删除个数"""
     removed = 0

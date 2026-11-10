@@ -30,6 +30,7 @@ from tidy_core import (
     DEFAULT_ROOT,
     ERROR,
     SCHEDULED_LIMIT,
+    CompressIndex,
     Engine,
     Progress,
     Resume,
@@ -38,6 +39,7 @@ from tidy_core import (
     clean_empty_dirs,
     cleanup_tmp,
     compress_file,
+    compress_signature,
     dedupe_block,
     expand_ignores,
     match_block,
@@ -63,6 +65,13 @@ KIND = {
     "compress-music": "音乐",
     "compress-video": "视频",
 }
+
+# 压缩后可能出现的扩展名，用来在转码后找回新文件（wav->mp3、png->jpg）
+COMPRESS_OUTPUT_EXTS = (
+    ".jpg", ".jpeg", ".png", ".webp",
+    ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".flac",
+    ".mp4", ".mkv", ".mov", ".webm", ".avi",
+)
 
 log = logging.getLogger("file_tidy")
 
@@ -320,10 +329,42 @@ def run_compress(block, comp, todo, args, resume, stats, saved_kind, force) -> N
     kind = KIND.get(stage, "压缩")
     label = _short_src(block)
 
-    pending = [f for f in todo if not resume.is_done(f.path)]
-    already = len(todo) - len(pending)
+    # 每个源目录一份持久记录，压过的不再重压
+    signature = compress_signature(comp)
+    indexes: dict[Path, CompressIndex] = {}
+    for d in block.dirs:
+        idx = CompressIndex(d, signature)
+        idx.load()
+        indexes[d] = idx
+
+    def index_for(p: Path) -> CompressIndex | None:
+        best = None
+        for d in block.dirs:
+            try:
+                inside = p.is_relative_to(d)
+            except ValueError:
+                inside = False
+            if inside and (best is None or len(d.parts) > len(best.parts)):
+                best = d
+        return indexes.get(best) if best is not None else None
+
+    pending = []
+    already = 0
+    known = 0
+    for f in todo:
+        if resume.is_done(f.path):
+            already += 1
+            continue
+        idx = index_for(f.path)
+        if idx is not None and idx.is_done(f.path):
+            known += 1
+            continue
+        pending.append(f)
+
     if already:
         log.info("%s 上次已处理 %d 个，跳过", label, already)
+    if known:
+        log.info("%s 之前压过 %d 个（记录在 .tidy-compressed）", label, known)
 
     # 先压旧的，定时任务被截断时每次都能往前推进
     pending.sort(key=lambda f: (f.stat.st_mtime, str(f.path)))
@@ -338,6 +379,8 @@ def run_compress(block, comp, todo, args, resume, stats, saved_kind, force) -> N
             pending = pending[:cap]
 
     if not pending:
+        for idx in indexes.values():
+            idx.close()
         return
 
     # 终端里先问一句，定时任务直接跑
@@ -348,6 +391,8 @@ def run_compress(block, comp, todo, args, resume, stats, saved_kind, force) -> N
             if ans == "skip":
                 log.info("跳过压缩块 %s", label)
                 stats["skipped_blocks"] += 1
+                for idx in indexes.values():
+                    idx.close()
                 return
             if ans == "all":
                 args.yes = True
@@ -385,9 +430,21 @@ def run_compress(block, comp, todo, args, resume, stats, saved_kind, force) -> N
             stats["failed"] += 1
             log.error("压缩失败 %s：%s", f.path, msg)
         resume.mark(f.path, stage, status, delta)
+        # 记一份持久记录；转码后路径会变（wav->mp3、png->jpg），按实际存在的那个记
+        if not args.dry_run:
+            idx = index_for(f.path)
+            if idx is not None:
+                cands = [f.path] + [f.path.with_suffix(e)
+                                    for e in COMPRESS_OUTPUT_EXTS]
+                for cand in cands:
+                    if cand.exists():
+                        idx.mark(cand, status)
+                        break
 
     prog.update(done=done, failed=failed, skipped=skipped_n, force=True)
     prog.finish(extra=f"省 {_human_size(saved)}")
+    for idx in indexes.values():
+        idx.close()
 
 
 def run_plain(block, todo, args, engine, resume, stats, force, taken) -> None:
