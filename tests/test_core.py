@@ -517,6 +517,20 @@ class TestResume(unittest.TestCase):
 
 
 class TestCompress(unittest.TestCase):
+    def test_music_skips_non_audio(self):
+        """.txt / .jpg 这类混在音乐目录里的文件不能被塞给 ffmpeg"""
+        from tidy_core import compress_file
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "歌词.txt"
+            p.write_text("not audio", encoding="utf-8")
+            blocks, _, _ = parse(
+                "/x\n    action: compress-music\n        format: mp3\n")
+            status, msg, saved = compress_file(p, blocks[0].actions[0])
+            self.assertEqual(status, "skip")
+            self.assertIn("不是音频", msg)
+            self.assertEqual(saved, 0)
+            self.assertTrue(p.exists())
+
     def test_preserve_time(self):
         """preserve_time: true 时压缩后修改时间不变"""
         import shutil

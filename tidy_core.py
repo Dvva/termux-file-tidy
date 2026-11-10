@@ -1510,6 +1510,12 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
         target = path if ext == ".mp4" else path.with_suffix(".mp4")
         timeout = 3600  # 视频慢，给足一小时
     else:
+        # 音乐块和图片/视频一样要有白名单，否则 .txt / .jpg 封面也会被塞给 ffmpeg
+        audio_exts = (".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg",
+                      ".opus", ".wma", ".ape", ".aif", ".aiff", ".alac",
+                      ".m4b", ".mp2", ".mpga", ".oga")
+        if ext not in audio_exts:
+            return "skip", f"不是音频文件：{ext or '无扩展名'}", 0
         fmt = (action.get("format", "mp3") or "mp3").strip().lower()
         bitrate = (action.get("bitrate", "320k") or "320k").strip()
         codec = {"mp3": "libmp3lame", "aac": "aac", "opus": "libopus"}.get(fmt)
