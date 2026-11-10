@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import random
@@ -18,6 +19,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -140,11 +142,20 @@ ACTION_PARAMS = {
     # 去重：keep 是主目录，重复时保留这里的那份，可写多行按顺序优先
     "dedupe": {"keep"},
     # 压缩图片：quality 是 jpg 质量刻度；max_edge 不写 = 不改尺寸
-    "compress-image": {"quality", "max_edge"},
+    # limit 是单次最多压几个（定时任务用），preserve_time 是否保留原时间戳
+    "compress-image": {"quality", "max_edge", "limit", "preserve_time"},
     # 压缩音乐：format 目标格式，bitrate 码率
-    "compress-music": {"format", "bitrate", "quality"},
+    "compress-music": {"format", "bitrate", "quality", "limit", "preserve_time"},
     # 压缩视频：height 是短边上限（1080p 写 1080），max_edge 是长边上限
-    "compress-video": {"max_edge", "height", "crf", "preset"},
+    "compress-video": {"max_edge", "height", "crf", "preset",
+                       "limit", "preserve_time"},
+}
+
+# 定时任务里每类压缩默认最多处理多少个，配置里的 limit: 优先
+SCHEDULED_LIMIT = {
+    "compress-image": 100,
+    "compress-music": 10,
+    "compress-video": 2,
 }
 
 # 原地操作的动作（不产生 src -> dst 移动），走单独的压缩分支
@@ -840,8 +851,12 @@ class Engine:
 
 def clean_empty_dirs(dirs: Iterable[Path], dry_run: bool,
                      ignores: Iterable[Path] = (),
-                     include_hidden: bool = False) -> list[Path]:
-    """自底向上删除空目录，默认跳过隐藏目录和 ignore 目录"""
+                     include_hidden: bool = False,
+                     on_dir: Callable[[Path, int], None] | None = None) -> list[Path]:
+    """自底向上删除空目录，默认跳过隐藏目录和 ignore 目录
+
+    on_dir(处理的源目录, 已删除个数)：每清完一个源目录回调一次，用于进度显示。
+    """
     ignore_set = [p.resolve() for p in ignores if p]
     removed: list[Path] = []
     for d in dirs:
@@ -871,6 +886,8 @@ def clean_empty_dirs(dirs: Iterable[Path], dry_run: bool,
                     removed.append(p)
             except OSError:
                 pass
+        if on_dir is not None:
+            on_dir(d, len(removed))
     return removed
 
 
@@ -891,12 +908,18 @@ def _sha256(path: Path) -> str:
 def dedupe_block(block: Block, root: Path, dry_run: bool,
                  ignores: Iterable[Path] = (),
                  include_hidden: bool = False,
-                 dest_root: Path | None = None) -> tuple[int, int, list[str]]:
+                 dest_root: Path | None = None,
+                 on_hash: Callable[[int, int], None] | None = None,
+                 on_group: Callable[[int, int, int], None] | None = None,
+                 ) -> tuple[int, int, list[str]]:
     """对一个块做去重，返回 (重复组数, 移动文件数, undo 记录)
 
     判定标准是「同名 + 同大小 + 同哈希」，三者全中才算重复，
     避免把同名不同版本的书写成重复。保留 keep 目录下的那份，
     keep 没写或都不在时按路径排序保留第一个。
+
+    on_hash(已读字节, 总字节)：哈希阶段的进度，去重最慢的就是读盘。
+    on_group(已完成组, 总组数, 已移动)：搬文件阶段的进度。
     """
     keep: list[Path] = []
     for a in block.actions:
@@ -910,47 +933,399 @@ def dedupe_block(block: Block, root: Path, dry_run: bool,
     if not files:
         return 0, 0, []
 
-    groups: dict[tuple[str, int], list[Path]] = {}
+    # 先按「同名 + 同大小」粗筛，只有这些才值得读全文件算哈希
+    buckets: dict[tuple[str, int], list[Path]] = {}
     for f in files:
-        groups.setdefault((f.path.name.lower(), f.stat.st_size), []).append(f.path)
+        buckets.setdefault((f.path.name.lower(), f.stat.st_size), []).append(f.path)
 
-    dup_groups = 0
-    records: list[str] = []
-    planned: set[str] = set()
-    for paths in groups.values():
+    total_bytes = 0
+    for paths in buckets.values():
+        if len(paths) >= 2:
+            total_bytes += sum(p.stat().st_size for p in paths if p.exists())
+
+    hashed_bytes = 0
+    same_groups: list[list[Path]] = []
+    for key, paths in buckets.items():
         if len(paths) < 2:
             continue
         by_hash: dict[str, list[Path]] = {}
         for p in paths:
             try:
-                by_hash.setdefault(_sha256(p), []).append(p)
+                h = _sha256(p)
+                size = p.stat().st_size
             except OSError as exc:
                 log.warning("读取失败 %s：%s", p, exc)
-        for same in by_hash.values():
-            if len(same) < 2:
                 continue
-            dup_groups += 1
-            same.sort(key=lambda p: (0 if _under(p, keep) else 1, str(p)))
-            for p in same[1:]:
+            by_hash.setdefault(h, []).append(p)
+            hashed_bytes += size
+            if on_hash is not None:
+                on_hash(hashed_bytes, max(total_bytes, 1))
+        same_groups.extend(same for same in by_hash.values() if len(same) >= 2)
+
+    dup_groups = 0
+    moved = 0
+    records: list[str] = []
+    planned: set[str] = set()
+    for same in same_groups:
+        same.sort(key=lambda p: (0 if _under(p, keep) else 1, str(p)))
+        for p in same[1:]:
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                rel = Path(p.name)
+            dst = base / rel
+            n = 1
+            while str(dst) in planned:
+                dst = base / rel.with_name(f"{rel.stem} ({n}){rel.suffix}")
+                n += 1
+            planned.add(str(dst))
+            if not dry_run:
                 try:
-                    rel = p.relative_to(root)
-                except ValueError:
-                    rel = Path(p.name)
-                dst = base / rel
-                n = 1
-                while str(dst) in planned:
-                    dst = base / rel.with_name(f"{rel.stem} ({n}){rel.suffix}")
-                    n += 1
-                planned.add(str(dst))
-                if not dry_run:
-                    try:
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(p), str(dst))
-                    except OSError as exc:
-                        log.error("移动失败 %s：%s", p, exc)
-                        continue
-                records.append(f"move\t{p}\t{dst}")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(p), str(dst))
+                except OSError as exc:
+                    log.error("移动失败 %s：%s", p, exc)
+                    continue
+            records.append(f"move\t{p}\t{dst}")
+            moved += 1
+        dup_groups += 1
+        if on_group is not None:
+            on_group(dup_groups, len(same_groups), moved)
     return dup_groups, len(records), records
+
+
+# ============================================================
+# 进度显示
+# ============================================================
+
+BAR_WIDTH = 20
+# 压缩留下的临时文件后缀，异常退出后要清掉
+TMP_MARK = ".tidy-tmp"
+
+
+def fmt_duration(sec: float) -> str:
+    """耗时：0.8s / 12.4s / 2m31s / 1h05m"""
+    if sec < 60:
+        return f"{sec:.1f}s"
+    total = int(round(sec))
+    minutes, seconds = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def fmt_bar(fraction: float, width: int = BAR_WIDTH) -> str:
+    """进度条：实心 █，空白用空格，不依赖终端配色"""
+    f = min(max(fraction, 0.0), 1.0)
+    filled = int(round(f * width))
+    if f > 0 and filled == 0:
+        filled = 1          # 只要动过就别显示成全空
+    return "█" * filled + " " * (width - filled)
+
+
+class Progress:
+    """单个规则块的进度条：一个块一条，块跑完就收尾，块之间互不影响。
+
+    终端里按 interval 秒节流重绘（不刷屏）；非终端（定时任务 / 重定向）
+    只在收尾时打一行终态，避免日志被刷新行淹没。
+
+    line 布局（移动/重命名/去重/清理）：
+        15:02:52  移动  [████████████████████] 100%  5/5 组  /DCIM/Screenshots  142/142 个  0.8s
+
+    三行布局（压缩，当前文件单独一行）：
+        15:26:12  压缩进度 [█████████████       ]  75%
+                  /path/7633.mp4  (64.3 MB)  省 62.1 MB   剩 6m
+                  视频  9/12    失败 0
+    """
+
+    def __init__(self, label: str, total: int, unit: str = "个", *,
+                 layout: str = "line", stream=None, interval: float = 1.0,
+                 force: bool | None = None, group: str = "", groups: int = 0,
+                 human: bool = False, current: str = "",
+                 indent: str = " " * 10):
+        self.label = label
+        self.total = max(int(total), 0)
+        self.unit = unit
+        self.layout = layout
+        self.stream = stream if stream is not None else sys.stdout
+        self.interval = interval
+        self.group = group
+        self.groups = groups
+        self.group_done = 0
+        self.human = human
+        self.indent = indent
+        self.done = 0
+        self.failed = 0
+        self.skipped = 0
+        self.current = current
+        self.extra = ""
+        self.started = time.monotonic()
+        self._last_draw = 0.0
+        self._drawn = 0
+        if force is None:
+            force = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.enabled = force
+
+    # ---------- 内部 ----------
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    def _fraction(self) -> float:
+        if self.total <= 0:
+            return 1.0
+        return min(self.done / self.total, 1.0)
+
+    def _eta(self) -> str:
+        """按已完成部分的平均速度估算剩余时间"""
+        if self.done <= 0 or self.done >= self.total:
+            return ""
+        left = self.total - self.done
+        return f"剩 {fmt_duration(self.elapsed / self.done * left)}"
+
+    def eta_text(self) -> str:
+        """剩余时间文本，给调用方拼进 extra 用"""
+        return self._eta()
+
+    def _counters(self) -> str:
+        """完成/总数，human=True 时按 KB/MB/GB 显示"""
+        if self.human:
+            return f"{_human_size(self.done)}/{_human_size(self.total)}"
+        return f"{self.done}/{self.total}"
+
+    def _render(self) -> list[str]:
+        pct = int(self._fraction() * 100)
+        bar = fmt_bar(self._fraction())
+        ts = datetime.now().strftime("%H:%M:%S")
+        head = f"{ts}  {self.label}"
+        if self.layout == "block":
+            lines = [f"{head} [{bar}] {pct:3d}%"]
+            detail = self.current
+            if self.extra:
+                detail = f"{detail}  {self.extra}" if detail else self.extra
+            lines.append(self.indent + detail)
+            tail = f"{self.group}  {self.done}/{self.total}" if self.group \
+                else f"{self.done}/{self.total} {self.unit}"
+            if self.failed:
+                tail += f"    失败 {self.failed}"
+            if self.skipped:
+                tail += f"    跳过 {self.skipped}"
+            lines.append(self.indent + tail)
+            return lines
+
+        parts = [f"{head}  [{bar}] {pct:3d}%"]
+        if self.groups:
+            parts.append(f"{self.group_done}/{self.groups} 组")
+        if self.current:
+            parts.append(self.current)
+        parts.append(f"{self._counters()} {self.unit}")
+        if self.failed:
+            parts.append(f"失败 {self.failed}")
+        if self.extra:
+            parts.append(self.extra)
+        parts.append(fmt_duration(self.elapsed))
+        return ["  ".join(parts)]
+
+    def _write(self, text: str) -> None:
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except (OSError, ValueError):
+            self.enabled = False
+
+    def _draw(self) -> None:
+        if not self.enabled:
+            return
+        lines = self._render()
+        out = ""
+        if self._drawn:
+            out += "\r"
+            if self._drawn > 1:
+                out += f"\x1b[{self._drawn - 1}A"
+            out += "\x1b[J"
+        out += "\n".join(lines)
+        self._write(out)
+        self._drawn = len(lines)
+
+    # ---------- 对外 ----------
+    def set_groups(self, total: int, done: int = 0) -> None:
+        self.groups, self.group_done = int(total), int(done)
+
+    def advance_group(self) -> None:
+        if self.group_done < self.groups:
+            self.group_done += 1
+
+    def update(self, *, done: int | None = None, failed: int | None = None,
+               skipped: int | None = None, current: str | None = None,
+               extra: str | None = None, force: bool = False) -> None:
+        if done is not None:
+            self.done = done
+        if failed is not None:
+            self.failed = failed
+        if skipped is not None:
+            self.skipped = skipped
+        if current is not None:
+            self.current = current
+        if extra is not None:
+            self.extra = extra
+        now = time.monotonic()
+        if not force and now - self._last_draw < self.interval:
+            return
+        self._last_draw = now
+        self._draw()
+
+    def finish(self, extra: str | None = None) -> None:
+        """收尾：补上剩余时间，画最后一次"""
+        if extra is not None:
+            self.extra = extra
+        if not self.enabled:
+            # 非终端不留刷新行，但压缩的三行布局信息（当前文件/省/计数）要保住
+            if self.layout == "block":
+                self._write("\n".join(self._render()) + "\n")
+                return
+            # 其它块只留一行终态，方便看日志
+            pct = int(self._fraction() * 100)
+            bits = [f"{self.label}", f"[{fmt_bar(self._fraction())}]",
+                    f"{pct:3d}%"]
+            if self.groups:
+                bits.append(f"{self.group_done}/{self.groups} 组")
+            if self.current:
+                bits.append(self.current)
+            bits.append(f"{self._counters()} {self.unit}")
+            if self.failed:
+                bits.append(f"失败 {self.failed}")
+            if self.extra:
+                bits.append(self.extra)
+            bits.append(fmt_duration(self.elapsed))
+            self._write("  ".join(bits) + "\n")
+            return
+        self._draw()
+        self._write("\n")
+        self._drawn = 0
+
+
+def cleanup_tmp(dirs: Iterable[Path], dry_run: bool = False) -> int:
+    """清掉上次中断留下的 .xxx.tidy-tmp.* 临时文件，返回删除个数"""
+    removed = 0
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for cur, dirnames, filenames in os.walk(d):
+            # 目标目录里的“重复文件”归档也顺手清一下
+            dirnames[:] = [n for n in dirnames if not n.startswith(".")]
+            for name in filenames:
+                if TMP_MARK not in name:
+                    continue
+                p = Path(cur) / name
+                if dry_run:
+                    log.info("将清理临时文件 %s", p)
+                else:
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        log.warning("清理临时文件失败 %s：%s", p, exc)
+                        continue
+                removed += 1
+    return removed
+
+
+# ============================================================
+# 续传
+# ============================================================
+
+RESUME_VERSION = 1
+
+
+class Resume:
+    """运行状态记录：异常退出后下次接着做，不用从头再来。
+
+    存储是 JSONL：第一行 header，之后每行一条已完成记录。
+    追加写、一行一条，进程被 kill 最多丢最后半行，不会把整个文件写坏。
+    配置改过了也照样接着做（只影响压缩这种耗时的块，其他动作本来就是幂等的）。
+    """
+
+    def __init__(self, state_dir: Path, conf_path: Path, enabled: bool = True,
+                 writable: bool = True):
+        self.enabled = enabled
+        self.writable = writable
+        self.conf_path = conf_path
+        key = hashlib.md5(str(conf_path).encode("utf-8")).hexdigest()[:12]
+        self.dir = state_dir / "resume"
+        self.path = self.dir / f"{key}.jsonl"
+        self.done: set[str] = set()
+        self.started = ""
+        self.count = 0
+        self.previous = 0
+        self._fh = None
+
+    def load(self) -> int:
+        """读上次进度，返回上次已完成的文件数"""
+        if not self.path.exists():
+            return 0
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue        # 中断时留下的半行，跳过
+            if "v" in rec:
+                self.started = rec.get("started", "")
+                continue
+            p = rec.get("p")
+            if p:
+                self.done.add(p)
+        self.previous = len(self.done)
+        return self.previous
+
+    def is_done(self, path: Path) -> bool:
+        return str(path) in self.done
+
+    def mark(self, path: Path, stage: str, result: str, saved: int = 0) -> None:
+        if not self.enabled or not self.writable:
+            return
+        if self._fh is None:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            is_new = not self.path.exists()
+            self._fh = self.path.open("a", encoding="utf-8")
+            if is_new:
+                self._fh.write(json.dumps({
+                    "v": RESUME_VERSION,
+                    "conf": str(self.conf_path),
+                    "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }, ensure_ascii=False) + "\n")
+        rec = {"p": str(path), "s": stage, "r": result}
+        if saved:
+            rec["b"] = int(saved)
+        self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+        self.done.add(str(path))
+        self.count += 1
+
+    def close(self, success: bool) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        if success and self.writable:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def summary(self) -> str:
+        if not self.previous:
+            return ""
+        when = f"（{self.started} 启动）" if self.started else ""
+        return f"上次未完成的任务{when}，已记录 {self.previous} 个文件"
 
 
 # ============================================================
@@ -967,24 +1342,29 @@ def _human_size(n: int) -> str:
     return f"{n} B"
 
 
-def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[str, str]:
-    """按 compress-image / compress-music 压缩单个文件并原地替换
+def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[str, str, int]:
+    """按 compress-image / compress-music / compress-video 压缩单个文件并原地替换
 
     - 默认只降清晰度、不动尺寸；写了 max_edge 才等比缩小
     - 压缩后体积没变小就保留原文件，不算失败
-    - 返回 (状态, 说明)：ok 已替换 / skip 无需或不能压，原文件未动 / fail 出错
+    - preserve_time: true（默认）时把原文件的访问 / 修改时间写回新文件
+      注意：Android / Linux 上「创建时间」是只读的，改不了，能保留的是
+      修改时间和访问时间
+    - 返回 (状态, 说明, 省下的字节数)：ok 已替换 / skip 无需或不能压 / fail 出错
     """
     ff = shutil.which("ffmpeg")
     if ff is None:
-        return "fail", "找不到 ffmpeg（pkg install ffmpeg）"
+        return "fail", "找不到 ffmpeg（pkg install ffmpeg）", 0
 
-    before = path.stat().st_size
+    preserve = action.get("preserve_time", "true").strip().lower() != "false"
+    st = path.stat()
+    before = st.st_size
     ext = path.suffix.lower()
 
     if action.name == "compress-image":
         quality = action.get("quality", "4").strip() or "4"
         max_edge = action.get("max_edge", "").strip()
-        tmp = path.with_name(f".{path.stem}.tidy-tmp{ext}")
+        tmp = path.with_name(f".{path.stem}{TMP_MARK}{ext}")
         cmd = [ff, "-y", "-loglevel", "error", "-i", str(path)]
         if max_edge and max_edge != "0":
             cmd += ["-vf",
@@ -997,7 +1377,7 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
             cmd += ["-compression_level", "9"]
         else:
             # gif / webp 先不碰：动图转码容易把动画弄坏
-            return "skip", f"不支持的图片格式：{ext or '无扩展名'}"
+            return "skip", f"不支持的图片格式：{ext or '无扩展名'}", 0
         cmd.append(str(tmp))
         target = path
         timeout = 600
@@ -1005,12 +1385,12 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
         video_exts = (".mp4", ".mkv", ".mov", ".avi", ".webm",
                       ".ts", ".m4v", ".flv", ".wmv", ".3gp")
         if ext not in video_exts:
-            return "skip", f"不支持的视频格式：{ext or '无扩展名'}"
+            return "skip", f"不支持的视频格式：{ext or '无扩展名'}", 0
         max_edge = action.get("max_edge", "").strip()
         height = action.get("height", "").strip()
         crf = action.get("crf", "23").strip() or "23"
         preset = action.get("preset", "veryfast").strip() or "veryfast"
-        tmp = path.with_name(f".{path.stem}.tidy-tmp.mp4")
+        tmp = path.with_name(f".{path.stem}{TMP_MARK}.mp4")
         if height:
             # 短边上限：横屏按高算、竖屏按宽算，1920x1080 写 1080 就保持 1080p
             vf = (f"scale='if(gt(iw,ih),-2,min(iw,{height}))':"
@@ -1035,35 +1415,36 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
         bitrate = (action.get("bitrate", "320k") or "320k").strip()
         codec = {"mp3": "libmp3lame", "aac": "aac", "opus": "libopus"}.get(fmt)
         if codec is None:
-            return "skip", f"不支持的音频格式：{fmt}"
-        tmp = path.with_name(f".{path.stem}.tidy-tmp.{fmt}")
+            return "skip", f"不支持的音频格式：{fmt}", 0
+        tmp = path.with_name(f".{path.stem}{TMP_MARK}.{fmt}")
         cmd = [ff, "-y", "-loglevel", "error", "-i", str(path),
                "-c:a", codec, "-b:a", bitrate, str(tmp)]
         target = path if ext == f".{fmt}" else path.with_suffix(f".{fmt}")
         timeout = 600
 
     if dry_run:
-        return "ok", f"将压缩（当前 {_human_size(before)}）"
+        return "ok", f"将压缩（当前 {_human_size(before)}）", 0
 
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         tmp.unlink(missing_ok=True)
-        return "fail", str(exc)
+        return "fail", str(exc), 0
 
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        return "fail", (lines[-1][:200] if lines else f"ffmpeg 退出码 {proc.returncode}")
+        msg = lines[-1][:200] if lines else f"ffmpeg 退出码 {proc.returncode}"
+        return "fail", msg, 0
 
     try:
         after = tmp.stat().st_size
     except OSError:
-        return "fail", "临时文件不见了"
+        return "fail", "临时文件不见了", 0
 
     if after >= before:
         tmp.unlink(missing_ok=True)
-        return "skip", f"压完没变小，保留原文件（{_human_size(before)}）"
+        return "skip", f"压完没变小，保留原文件（{_human_size(before)}）", 0
 
     try:
         tmp.replace(target)
@@ -1073,10 +1454,18 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
             path.unlink(missing_ok=True)
     except OSError as exc:
         tmp.unlink(missing_ok=True)
-        return "fail", str(exc)
+        return "fail", str(exc), 0
+
+    if preserve:
+        # 创建时间（birthtime）在 Android / Linux 上改不了，
+        # 能还原的是修改时间和访问时间
+        try:
+            os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+        except OSError as exc:
+            log.warning("还原时间戳失败 %s：%s", target, exc)
 
     return "ok", (f"{_human_size(before)} -> {_human_size(after)}，"
-                  f"省 {_human_size(before - after)}")
+                  f"省 {_human_size(before - after)}"), before - after
 
 
 def undo(undo_path: Path, dry_run: bool = False) -> tuple[int, int]:

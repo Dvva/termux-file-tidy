@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """tidy_core 的单元测试与端到端小样本"""
 
+import os
 import sys
 import tempfile
 import unittest
@@ -401,6 +402,189 @@ class TestIgnore(unittest.TestCase):
 
             self.assertEqual(len(owner_blocks(blocks, src / "a.jpg")), 1)
             self.assertEqual(len(owner_blocks(blocks, src / "sub" / "b.jpg")), 0)
+
+
+class TestProgress(unittest.TestCase):
+    def test_bar_uses_spaces(self):
+        """空白格用空格，不用 ░，任何终端都能正常显示"""
+        from tidy_core import fmt_bar
+        self.assertEqual(fmt_bar(0.0), " " * 20)
+        self.assertEqual(fmt_bar(1.0), "█" * 20)
+        s = fmt_bar(0.35)
+        self.assertEqual(len(s), 20)
+        self.assertEqual(s.count("█"), 7)
+        self.assertLessEqual(set(s), {"█", " "})
+
+    def test_line_finish_format(self):
+        import io
+        from tidy_core import Progress
+        buf = io.StringIO()
+        p = Progress("移动", 10, "个", stream=buf, force=False, groups=2)
+        p.set_groups(2, 1)
+        p.update(done=5, current="/DCIM/Screenshots")
+        p.finish()
+        out = buf.getvalue()
+        self.assertIn("移动", out)
+        self.assertIn("50%", out)
+        self.assertIn("1/2 组", out)
+        self.assertIn("5/10 个", out)
+        self.assertIn("/DCIM/Screenshots", out)
+
+    def test_block_layout_three_lines(self):
+        import io
+        from tidy_core import Progress
+        buf = io.StringIO()
+        p = Progress("压缩进度", 12, layout="block", group="视频",
+                     stream=buf, force=False)
+        p.update(done=9, failed=1, current="/x/a.mp4  (64.3 MB)",
+                 extra="省 62.1 MB")
+        p.finish(extra="省 62.1 MB")
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("压缩进度", lines[0])
+        self.assertIn("75%", lines[0])
+        self.assertIn("/x/a.mp4", lines[1])
+        self.assertIn("省 62.1 MB", lines[1])
+        self.assertIn("视频", lines[2])
+        self.assertIn("9/12", lines[2])
+        self.assertIn("失败 1", lines[2])
+
+    def test_non_tty_prints_single_line(self):
+        import io
+        from tidy_core import Progress
+        buf = io.StringIO()
+        p = Progress("扫描", 2200, "个文件", stream=buf, force=False)
+        p.update(done=2200)
+        p.finish()
+        self.assertEqual(len(buf.getvalue().splitlines()), 1)
+
+
+class TestResume(unittest.TestCase):
+    def test_roundtrip(self):
+        from tidy_core import Resume
+        with tempfile.TemporaryDirectory() as td:
+            conf = Path(td) / "a.conf"
+            conf.write_text("x")
+            state = Path(td) / "state"
+
+            r = Resume(state, conf)
+            self.assertEqual(r.load(), 0)
+            r.mark(Path("/a/b.mp4"), "compress-video", "ok", 100)
+            r.close(success=False)
+
+            r2 = Resume(state, conf)
+            self.assertEqual(r2.load(), 1)
+            self.assertTrue(r2.is_done(Path("/a/b.mp4")))
+            self.assertFalse(r2.is_done(Path("/a/c.mp4")))
+            r2.close(success=True)
+
+            r3 = Resume(state, conf)
+            self.assertEqual(r3.load(), 0, "正常结束后状态文件要删掉")
+
+    def test_truncated_line_is_tolerated(self):
+        """被 kill 时可能留下半行 JSON，下次不能因此崩掉"""
+        from tidy_core import Resume
+        with tempfile.TemporaryDirectory() as td:
+            conf = Path(td) / "a.conf"
+            conf.write_text("x")
+            state = Path(td) / "state"
+            r = Resume(state, conf)
+            r.mark(Path("/a/b.mp4"), "compress-video", "ok")
+            r.close(success=False)
+
+            raw = r.path.read_text(encoding="utf-8")
+            r.path.write_text(raw + '{"p": "/a/half', encoding="utf-8")
+
+            r2 = Resume(state, conf)
+            self.assertEqual(r2.load(), 1)
+
+    def test_cleanup_tmp(self):
+        from tidy_core import TMP_MARK, cleanup_tmp
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "sub").mkdir()
+            (root / f".a{TMP_MARK}.mp4").write_text("x")
+            (root / "sub" / f".b{TMP_MARK}.mp3").write_text("y")
+            (root / "keep.mp4").write_text("z")
+
+            self.assertEqual(cleanup_tmp([root], dry_run=True), 2)
+            self.assertEqual(len(list(root.rglob(f"*{TMP_MARK}*"))), 2,
+                             "dry-run 不能真删")
+
+            self.assertEqual(cleanup_tmp([root]), 2)
+            self.assertEqual(len(list(root.rglob(f"*{TMP_MARK}*"))), 0)
+            self.assertTrue((root / "keep.mp4").exists())
+
+
+class TestCompress(unittest.TestCase):
+    def test_preserve_time(self):
+        """preserve_time: true 时压缩后修改时间不变"""
+        import shutil
+        import subprocess
+
+        from tidy_core import compress_file
+        ff = shutil.which("ffmpeg")
+        if ff is None:
+            self.skipTest("没有 ffmpeg")
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.jpg"
+            subprocess.run(
+                [ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "testsrc2=size=1600x1200:rate=1", "-frames:v", "1",
+                 "-q:v", "1", str(p)],
+                check=True, timeout=60)
+            old = 1600000000
+            os.utime(p, (old, old))
+
+            blocks, _, _ = parse(
+                "/x\n"
+                "    action: compress-image\n"
+                "        quality: 31\n"
+                "        preserve_time: true\n"
+            )
+            status, msg, _saved = compress_file(p, blocks[0].actions[0])
+            if status != "ok":
+                self.skipTest(f"这张图压不小：{msg}")
+            self.assertAlmostEqual(p.stat().st_mtime, old, delta=1)
+
+    def test_no_preserve_time(self):
+        import shutil
+        import subprocess
+
+        from tidy_core import compress_file
+        ff = shutil.which("ffmpeg")
+        if ff is None:
+            self.skipTest("没有 ffmpeg")
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.jpg"
+            subprocess.run(
+                [ff, "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "testsrc2=size=1600x1200:rate=1", "-frames:v", "1",
+                 "-q:v", "1", str(p)],
+                check=True, timeout=60)
+            old = 1600000000
+            os.utime(p, (old, old))
+
+            blocks, _, _ = parse(
+                "/x\n"
+                "    action: compress-image\n"
+                "        quality: 31\n"
+                "        preserve_time: false\n"
+            )
+            status, msg, _saved = compress_file(p, blocks[0].actions[0])
+            if status != "ok":
+                self.skipTest(f"这张图压不小：{msg}")
+            self.assertGreater(p.stat().st_mtime, old + 86400 * 365,
+                               "关闭保留时间后应该是当前时间")
+
+
+class TestTabIndent(unittest.TestCase):
+    def test_tab_is_error(self):
+        _, issues, _ = parse("/A\n\t/x\n")
+        msgs = " ".join(i.msg for i in issues if i.level == "error")
+        self.assertIn("Tab", msgs)
 
 
 if __name__ == "__main__":

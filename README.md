@@ -281,6 +281,73 @@ ignore: /DCIM/*/thumbnails
 | `command` | `cmd:` | 执行 shell 命令，`{}` 代表当前文件路径 |
 | `append` | `text:`、`file:` | 向 `file:` 追加 `text:` |
 | `clean` | —— | 收尾时清空该源目录下的空文件夹 |
+| `dedupe` | `keep:` | 去重：同名 + 同大小 + 同哈希才算重复 |
+| `compress-image` | `quality:`、`max_edge:`、`limit:`、`preserve_time:` | 压缩图片 |
+| `compress-music` | `format:`、`bitrate:`、`limit:`、`preserve_time:` | 压缩音乐 / 转格式 |
+| `compress-video` | `height:`、`max_edge:`、`crf:`、`preset:`、`limit:`、`preserve_time:` | 压缩视频 |
+
+### 压缩类动作
+
+三个压缩动作都是**原地替换**，共同约定：
+
+- **默认只降清晰度、不动尺寸**；写了 `max_edge:`（长边上限）才等比缩小
+- 压缩后**没变小**就保留原文件，不算失败（计入「跳过」）
+- 失败保留原文件，不删任何东西
+- `preserve_time: true`（默认）把原文件的**修改时间 / 访问时间**写回新文件
+  > Android / Linux 的「创建时间」（birth time）是只读的，改不了；能保住的是 mtime 和 atime
+- `limit: N` 只在**定时任务**（`--scheduled`）里生效：本次最多压 N 个，剩下的下次接着做
+
+```conf
+# 图片：quality 1-31，数字越大压得越狠（jpg 用 -q:v，png 直接拉满压缩级别）
+/__我的文件/同人图*
+    action: compress-image
+        quality: 5
+        limit: 100
+        preserve_time: true
+
+# 音乐：统一转 mp3 320k，格式变了会把原文件删掉
+/__我的文件/_归档文件/音乐
+    action: compress-music
+        format: mp3
+        bitrate: 320k
+        limit: 10
+
+# 视频：height 是短边上限（写 1080 就是 1080p，横屏 1920×1080、竖屏 1080×1920）
+/__我的文件/收藏视频
+    action: compress-video
+        height: 1080
+        crf: 23
+        limit: 2
+```
+
+| 参数 | 适用 | 说明 |
+|---|---|---|
+| `quality:` | image | jpg 质量刻度 1-31，越大越糊、越小越清晰 |
+| `max_edge:` | image / video | 长边上限，等比缩小；不写就不动尺寸 |
+| `height:` | video | **短边**上限，1080 = 1080p |
+| `crf:` | video | 18-28 常用，越大越糊 |
+| `preset:` | video | x264 预设，默认 `veryfast` |
+| `format:` | music | `mp3` / `aac` / `opus` |
+| `bitrate:` | music | 如 `320k` |
+| `limit:` | 全部压缩 | 定时任务单次配额 |
+| `preserve_time:` | 全部压缩 | `true`（默认）/ `false`，是否保留原时间戳 |
+
+### 去重 `dedupe`
+
+判定标准是**同名 + 同大小 + 同哈希**，三者全中才算重复，避免把同名不同版本的书误删。
+
+```conf
+/Books/
+    action: dedupe
+        keep: /Books/Cloud
+```
+
+- `keep:` 是**主目录**，重复时保留这里那份；写在 `keep:` 里的路径优先，其余按路径排序保留第一个
+- 被搬走的重复文件进 `_重复文件/<时间戳>/<原相对路径>`，**不删除**
+- 可写多行 `keep:`，按顺序优先
+- 去重块在处理其他规则**之前**先跑，先把重复的归位
+
+---
 
 ### rename 的参数
 
@@ -429,29 +496,41 @@ action: rename
 
 ## 八、语法检查器
 
-> ⚠️ 现有 `check_conf.py` 是 v1 版，只认旧语法。适配 v2 的工作还没做，在那之前请手动对照本文档检查。
+`check_conf.py` 已适配 v2，解析逻辑直接复用 `tidy_core.parse`，所以「检查器认为对的配置」和「执行器实际解析的配置」永远一致。
 
-适配后计划检查：
+```bash
+python check_conf.py                                  # 默认检查同目录配置
+python check_conf.py -q                               # 只显示错误
+python check_conf.py --strict                         # 警告也算失败
+```
+
+检查内容：
 
 | 类别 | 内容 |
 |---|---|
-| 缩进 | 只允许 0 / 4 / 8 空格；禁止 Tab；禁止跳级 |
+| 缩进 | 只允许 0 / 4 / 8 空格；Tab 直接报错；非 4 倍数报错 |
 | 结构 | 源目录必须顶格且 `/` 开头；块边界（空行或顶格）；目标最多一个；8 缩进必须跟在 `action:` 后 |
 | 跳过 | `skip:` 的取值只能是 `true` / `false` |
-| 动作 | 动作名是否认识；必需参数是否缺失；参数名是否属于该动作 |
-| 通配符 | 裸行是否形似已知指令（如 `matchs:`，疑似拼写错误） |
+| 动作 | 动作名是否认识；参数名是否属于该动作 |
 | 正则 | `match:` / `exclude:` / `replace:` 能否编译 |
 | 变量 | 是否在已知变量表里；时间变量参数是否合法 |
-| 路径 | 必须 `/` 开头；不能含反斜杠；不能有重复斜杠 |
 
 参数：
 
 | 参数 | 说明 |
 |---|---|
-| `--quiet` / `-q` | 不显示提示级 |
-| `--strict` | 提示也算失败 |
+| `--quiet` / `-q` | 不显示警告 |
+| `--strict` | 警告也算失败 |
 
 退出码：`0` 无错误，`1` 有错误，`2` 文件不存在。
+
+### 只看配置不执行
+
+```bash
+tify blocks
+```
+
+打印解析后的规则块、每个块的源、动作、能吃到多少文件，**一个文件都不动**。改完配置想先确认结构时用它。
 
 ---
 
@@ -488,7 +567,8 @@ tify         # 执行
 
 ```bash
 python tasker_file_tidy.py --dry-run      # 预览，不动文件
-python tasker_file_tidy.py                # 真正执行
+python tasker_file_tidy.py                # 真正执行（有上次进度会自动接着做）
+python tasker_file_tidy.py blocks         # 只打印配置，不执行
 python tasker_file_tidy.py --only 3       # 只跑第 3 个规则块
 python tasker_file_tidy.py --undo         # 撤销上一次运行
 python tasker_file_tidy.py --verbose      # 输出详细日志
@@ -496,14 +576,70 @@ python tasker_file_tidy.py --verbose      # 输出详细日志
 
 | 参数 | 说明 |
 |---|---|
+| `blocks` | 只打印解析后的规则块，不执行 |
 | `--config` / `-c` | 配置文件路径，默认同目录下的 `tasker_file_tify.conf` |
 | `--dry-run` / `-n` | 只打印「源 → 目标」，不落盘 |
 | `--undo` | 按 `undo.log` 反向恢复 |
 | `--only N` | 只跑第 N 个规则块 |
 | `--root` | 覆盖存储根 `/storage/emulated/0`（测试用） |
+| `--scheduled` | 定时任务模式：压缩块按 `limit` 只跑一部分，不交互询问 |
+| `--fresh` | 忽略上次未完成的进度，从头开始 |
+| `--yes` / `-y` | 压缩块不再询问，全部执行 |
+| `--progress` / `--no-progress` | 强制开关进度条（默认只在终端里显示） |
 | `--verbose` / `-v` | 输出详细日志 |
 | `--no-notify` | 不推送 Termux 通知 |
 | `--include-hidden` | 也处理 `.` 开头的隐藏目录（默认跳过） |
+
+### 进度条
+
+每个规则块有自己的进度条，块跑完就收尾。终端里每秒刷新一次，重定向到文件时只在结束时留一行终态。
+
+```text
+15:02:52  移动  [████████████████████] 100%  5/5 组  /DCIM/Screenshots  142/142 个  0.8s
+```
+
+压缩是三行布局，当前文件单独一行：
+
+```text
+15:26:12  压缩进度 [█████████████       ]  75%
+          /__我的文件/收藏视频/7633.mp4  (64.3 MB)  省 62.1 MB   剩 6m
+          视频  9/12    失败 0
+```
+
+- `9/12` 是「已完成 / 总数」
+- `5/5 组` 是块内按目录分组后的完成情况
+- 压缩的 `剩 6m` 是按已完成文件的平均速度估算的
+
+### 续传
+
+因为压缩视频很慢，中途被打断（Ctrl+C、系统杀进程、电池优化）不该从头再来。
+
+- 每处理完一个文件就往 `~/.local/state/file_tidy/resume/` 追加一行 JSON
+- 下次启动自动读取，**已完成的文件直接跳过**；正常跑完会把这个状态文件删掉
+- 上次中断残留的 `.xxx.tidy-tmp.*` 临时文件**会在启动时自动清理**
+- 配置改过了也照样续传（只影响压缩这类耗时的块，其他动作本身是幂等的）
+- 想强制从头来：`tify --fresh`
+
+```text
+$ tify
+上次未完成的任务（2026-11-10 06:00:00 启动），已记录 1 个文件
+清理上次残留的临时文件 1 个
+扫描  [████████████████████]  100%  2200/2200 个文件  2.1s
+```
+
+### 压缩块的交互选择
+
+终端里手动跑（stdin 是终端）时，每个压缩块执行前会问一句：
+
+```text
+块 31  /__我的文件/收藏视频   12 个文件 · 1.8 GB  [compress-video]
+  执行？[Y/s/a]  回车=执行  s=跳过这个块  a=后面全部执行不再问
+```
+
+- 回车 = 压这个块
+- `s` = 跳过这个块（目录），继续后面的
+- `a` = 剩下的块全部执行，不再询问
+- 定时任务（`--scheduled`）或非终端环境不询问，按 `limit` 直接跑
 
 ### 状态文件
 
@@ -511,6 +647,7 @@ python tasker_file_tidy.py --verbose      # 输出详细日志
 |---|---|
 | 日志 | `~/.local/state/file_tidy/tidy_YYYYMMDD.log` |
 | 撤销记录 | `~/.local/state/file_tidy/undo.log` |
+| 续传进度 | `~/.local/state/file_tidy/resume/<conf哈希>.jsonl` |
 
 可用环境变量 `FILE_TIDY_STATE` 指定其它目录。
 
@@ -564,3 +701,9 @@ termux-job-scheduler \
 ```
 
 `--persisted true` 保证重启后计划仍生效。
+
+定时任务建议加 `--scheduled`，压缩块会按 `limit` 只跑一部分，避免一次跑几个小时：
+
+- 图片默认 100 个 / 音乐 10 个 / 视频 2 个（配置里的 `limit:` 优先）
+- 每次都从**最旧的文件**开始，保证配额轮转得到，不会永远压同一批
+- 上次没压完的，下次启动接着做（续传）
