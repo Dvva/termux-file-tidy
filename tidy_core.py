@@ -146,8 +146,9 @@ ACTION_PARAMS = {
     "compress-image": {"quality", "max_edge", "limit", "preserve_time"},
     # 压缩音乐：format 目标格式，bitrate 码率
     "compress-music": {"format", "bitrate", "quality", "limit", "preserve_time"},
-    # 压缩视频：height 是短边上限（1080p 写 1080），max_edge 是长边上限
-    "compress-video": {"max_edge", "height", "crf", "preset",
+    # 压缩视频：resolution 按视频网站口径写 1080p / 720p；height 是短边数值；
+    # max_edge 是长边上限（1080 会得到 1080×608 这种）
+    "compress-video": {"resolution", "max_edge", "height", "crf", "preset",
                        "limit", "preserve_time"},
 }
 
@@ -1342,6 +1343,54 @@ def _human_size(n: int) -> str:
     return f"{n} B"
 
 
+# 视频网站的分辨率档位，单位是「短边像素」
+RESOLUTION_ALIAS = {
+    "8k": 4320,
+    "4k": 2160,
+    "2k": 1440,
+    "1440p": 1440,
+    "1080p": 1080,
+    "720p": 720,
+    "576p": 576,
+    "480p": 480,
+    "360p": 360,
+}
+
+
+def parse_resolution(text: str) -> int:
+    """把 1080p / 720P / 4k / 1080 解析成短边像素数，认不出来返回 0"""
+    s = (text or "").strip().lower()
+    if not s:
+        return 0
+    if s in RESOLUTION_ALIAS:
+        return RESOLUTION_ALIAS[s]
+    if s.endswith("p"):
+        s = s[:-1]
+    return int(s) if s.isdigit() else 0
+
+
+def video_scale_filter(action: Action) -> str | None:
+    """算出视频的缩放滤镜；返回 None 表示完全不改尺寸
+
+    优先级：resolution（视频网站档位）> height（短边数值）> max_edge（长边上限）。
+    短边档位只降不升：本来就是 720p 的不会被拉到 1080p，宽高比保持不变。
+    三个都不写就不缩放，只靠 crf 降码率——和图片「不写 max_edge 就不缩」一致。
+    """
+    short = parse_resolution(action.get("resolution"))
+    if short <= 0:
+        short = parse_resolution(action.get("height"))
+    if short > 0:
+        # 横屏按高、竖屏按宽，另一边用 -2 自动算并保持偶数
+        return (f"scale='if(gt(iw,ih),-2,min(iw,{short}))':"
+                f"'if(gt(iw,ih),min(ih,{short}),-2)'")
+
+    edge = parse_resolution(action.get("max_edge"))
+    if edge > 0:
+        return (f"scale='min({edge},iw)':'min({edge},ih)'"
+                f":force_original_aspect_ratio=decrease:force_divisible_by=2")
+    return None
+
+
 def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[str, str, int]:
     """按 compress-image / compress-music / compress-video 压缩单个文件并原地替换
 
@@ -1386,24 +1435,14 @@ def compress_file(path: Path, action: Action, dry_run: bool = False) -> tuple[st
                       ".ts", ".m4v", ".flv", ".wmv", ".3gp")
         if ext not in video_exts:
             return "skip", f"不支持的视频格式：{ext or '无扩展名'}", 0
-        max_edge = action.get("max_edge", "").strip()
-        height = action.get("height", "").strip()
         crf = action.get("crf", "23").strip() or "23"
         preset = action.get("preset", "veryfast").strip() or "veryfast"
         tmp = path.with_name(f".{path.stem}{TMP_MARK}.mp4")
-        if height:
-            # 短边上限：横屏按高算、竖屏按宽算，1920x1080 写 1080 就保持 1080p
-            vf = (f"scale='if(gt(iw,ih),-2,min(iw,{height}))':"
-                  f"'if(gt(iw,ih),min(ih,{height}),-2)'")
-        elif max_edge:
-            vf = (f"scale='min({max_edge},iw)':'min({max_edge},ih)'"
-                  f":force_original_aspect_ratio=decrease:force_divisible_by=2")
-        else:
-            vf = ("scale='if(gt(iw,ih),-2,min(iw,1080))':"
-                  "'if(gt(iw,ih),min(ih,1080),-2)'")
-        cmd = [
-            ff, "-y", "-loglevel", "error", "-i", str(path),
-            "-vf", vf,
+        vf = video_scale_filter(action)
+        cmd = [ff, "-y", "-loglevel", "error", "-i", str(path)]
+        if vf:
+            cmd += ["-vf", vf]
+        cmd += [
             "-c:v", "libx264", "-crf", crf, "-preset", preset,
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart", str(tmp),

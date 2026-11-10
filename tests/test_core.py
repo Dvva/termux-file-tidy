@@ -587,5 +587,92 @@ class TestTabIndent(unittest.TestCase):
         self.assertIn("Tab", msgs)
 
 
+class TestVideoScale(unittest.TestCase):
+    """视频按视频网站口径分档：短边定档，只降不升"""
+
+    def _vf(self, conf: str):
+        from tidy_core import video_scale_filter
+        blocks, issues, _ = parse("/v\n    action: compress-video\n" + conf)
+        self.assertEqual([i for i in issues if i.level == "error"], [])
+        return video_scale_filter(blocks[0].actions[0])
+
+    def test_parse_resolution(self):
+        from tidy_core import parse_resolution
+        self.assertEqual(parse_resolution("1080p"), 1080)
+        self.assertEqual(parse_resolution("720P"), 720)
+        self.assertEqual(parse_resolution("4k"), 2160)
+        self.assertEqual(parse_resolution("1080"), 1080)
+        self.assertEqual(parse_resolution(""), 0)
+        self.assertEqual(parse_resolution("abc"), 0)
+
+    def test_no_filter_when_nothing_written(self):
+        """不写分辨率档位就完全不缩放，只靠 crf 降质量"""
+        self.assertIsNone(self._vf("        crf: 23\n"))
+
+    def test_resolution_filter_structure(self):
+        vf = self._vf("        resolution: 720p\n")
+        self.assertIn("min(ih,720)", vf)
+        self.assertIn("min(iw,720)", vf)
+        self.assertIn("-2", vf)
+
+    def test_max_edge_still_available(self):
+        vf = self._vf("        max_edge: 1080\n")
+        self.assertIn("force_original_aspect_ratio=decrease", vf)
+
+    def _probe(self, p):
+        import subprocess
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(p)],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        w, h = out.split(",")[:2]
+        return int(w), int(h)
+
+    def _make(self, p, size):
+        import subprocess
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"testsrc2=size={size}:rate=10", "-t", "1",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", str(p)],
+            check=True, timeout=120)
+
+    def test_small_video_is_not_upscaled(self):
+        """640x360 写 720p，压完还是 640x360（视频网站的规则：不放大）"""
+        import shutil
+        from tidy_core import compress_file
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            self.skipTest("没有 ffmpeg/ffprobe")
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "small.mp4"
+            self._make(p, "640x360")
+            blocks, _, _ = parse(
+                "/v\n    action: compress-video\n        resolution: 720p\n"
+                "        crf: 40\n")
+            status, msg, _ = compress_file(p, blocks[0].actions[0])
+            if status != "ok":
+                self.skipTest(f"没压小：{msg}")
+            self.assertEqual(self._probe(p), (640, 360),
+                             "小于目标档位的视频不能被放大")
+
+    def test_large_video_is_downscaled(self):
+        """1920x1080 写 720p，压完是 1280x720"""
+        import shutil
+        from tidy_core import compress_file
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            self.skipTest("没有 ffmpeg/ffprobe")
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "big.mp4"
+            self._make(p, "1920x1080")
+            blocks, _, _ = parse(
+                "/v\n    action: compress-video\n        resolution: 720p\n"
+                "        crf: 40\n")
+            status, msg, _ = compress_file(p, blocks[0].actions[0])
+            if status != "ok":
+                self.skipTest(f"没压小：{msg}")
+            self.assertEqual(self._probe(p), (1280, 720))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

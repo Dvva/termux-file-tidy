@@ -312,10 +312,10 @@ ignore: /DCIM/*/thumbnails
         bitrate: 320k
         limit: 10
 
-# 视频：height 是短边上限（写 1080 就是 1080p，横屏 1920×1080、竖屏 1080×1920）
+# 视频：按视频网站口径写档位，1080p = 短边 1080，只降不升
 /__我的文件/收藏视频
     action: compress-video
-        height: 1080
+        resolution: 1080p
         crf: 23
         limit: 2
 ```
@@ -324,13 +324,37 @@ ignore: /DCIM/*/thumbnails
 |---|---|---|
 | `quality:` | image | jpg 质量刻度 1-31，越大越糊、越小越清晰 |
 | `max_edge:` | image / video | 长边上限，等比缩小；不写就不动尺寸 |
-| `height:` | video | **短边**上限，1080 = 1080p |
+| `resolution:` | video | 视频网站档位：`1080p` / `720p` / `480p` / `4k`，按**短边**算 |
+| `height:` | video | 同 `resolution`，直接写数值，如 `1080` |
 | `crf:` | video | 18-28 常用，越大越糊 |
 | `preset:` | video | x264 预设，默认 `veryfast` |
 | `format:` | music | `mp3` / `aac` / `opus` |
 | `bitrate:` | music | 如 `320k` |
 | `limit:` | 全部压缩 | 定时任务单次配额 |
 | `preserve_time:` | 全部压缩 | `true`（默认）/ `false`，是否保留原时间戳 |
+
+### 视频分辨率怎么算
+
+`resolution` 按视频网站的分档来，**短边定档**：
+
+| 原视频 | `resolution: 1080p` | `resolution: 720p` |
+|---|---|---|
+| 3840×2160 | 1920×1080 | 1280×720 |
+| 1920×1080 | 不变 | 1280×720 |
+| 1280×720 | **不变**（不放大） | 不变 |
+| 1080×1920（竖屏） | 不变 | 1080×**720** |
+| 640×360 | **不变**（不放大） | 不变 |
+
+规则是「只降不升」——比目标档位小的视频原样保留尺寸，宽高比始终不变。
+
+**三个缩放参数都不写时，完全不改尺寸**，只靠 `crf` 降码率，这才是纯粹的「只降清晰度」：
+
+```conf
+action: compress-video
+    crf: 26            # 分辨率原样，只压质量
+```
+
+优先级：`resolution` > `height` > `max_edge`，同时写只认第一个。
 
 ### 去重 `dedupe`
 
