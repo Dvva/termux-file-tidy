@@ -278,8 +278,10 @@ def run_dedupe(block, args, root, engine, resume, stats, force, ignore_dirs) -> 
     label = _short_src(block)
     hash_prog = Progress("去重", 1, "字节", human=True, force=force,
                          current=label, interval=0.5)
+    seen = {"hash": False, "group": False}
 
     def on_hash(done: int, total: int) -> None:
+        seen["hash"] = True
         hash_prog.total = max(total, 1)
         hash_prog.update(done=min(done, total), current=label)
 
@@ -287,6 +289,7 @@ def run_dedupe(block, args, root, engine, resume, stats, force, ignore_dirs) -> 
                           interval=0.5)
 
     def on_group(done: int, total: int, moved: int) -> None:
+        seen["group"] = True
         group_prog.total = max(total, 1)
         group_prog.update(done=done, current=label,
                           extra=f"重复 {moved} 个")
@@ -295,8 +298,11 @@ def run_dedupe(block, args, root, engine, resume, stats, force, ignore_dirs) -> 
         block, root, args.dry_run, ignore_dirs, args.include_hidden,
         on_hash=on_hash, on_group=on_group)
 
-    hash_prog.finish()
-    group_prog.finish(extra=f"重复 {moved_n} 个" if moved_n else "")
+    # 没有任何同名同大小的候选时，两个回调都不会触发，就别画一条空进度条
+    if seen["hash"]:
+        hash_prog.finish()
+    if seen["group"]:
+        group_prog.finish(extra=f"重复 {moved_n} 个" if moved_n else "")
 
     if groups_n:
         log.info("去重：%d 组重复，移动 %d 个", groups_n, moved_n)
