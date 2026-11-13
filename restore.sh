@@ -45,6 +45,17 @@ usage() {
     awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
 }
 
+# ffmpeg 起不来，多半是 libc++ 比 libplacebo 旧（重装后只 pkg install 不 upgrade 就会这样）
+ensure_ffmpeg() {
+    local ff="/data/data/com.termux/files/usr/bin/ffmpeg"
+    [ -x "$ff" ] || return 1
+    "$ff" -version >/dev/null 2>&1 && return 0
+    warn "ffmpeg 无法运行（多半是 libc++ 太旧），补装 libc++ 再试"
+    pkg install -y libc++ >/dev/null 2>&1 || true
+    dpkg --configure -a >/dev/null 2>&1 || true
+    "$ff" -version >/dev/null 2>&1
+}
+
 for arg in "$@"; do
     case "$arg" in
         --help|-h) usage; exit 0 ;;
@@ -90,10 +101,14 @@ if [ "$DO_PKG" -eq 1 ]; then
     command -v pkg >/dev/null 2>&1 || die "找不到 pkg 命令，这不像 Termux 环境"
     pkg update -y >/dev/null 2>&1 || warn "pkg update 失败，继续尝试直接安装"
     # shellcheck disable=SC2086
-    if ! pkg install -y $PKGS; then
-        die "安装失败：pkg install -y $PKGS（检查网络或镜像）"
+    if pkg install -y $PKGS; then
+        ok "已安装：$PKGS"
+    else
+        # ffmpeg 的半配置状态常常是 libc++ 太旧导致 libplacebo 链接失败，
+        # 这不该中断整场恢复（tify 和定时任务不依赖 ffmpeg），修一下再继续
+        warn "pkg install 报了错误，尝试修 ffmpeg 的链接问题"
+        ensure_ffmpeg || warn "ffmpeg 仍未修好，压缩块会跳过；可手动跑 pkg upgrade"
     fi
-    ok "已安装：$PKGS"
     if [ "$FULL" -eq 1 ]; then
         # shellcheck disable=SC2086
         pkg install -y $FULL_PKGS && ok "已安装编译链：$FULL_PKGS" || warn "编译链装失败（不影响整理功能）"
@@ -143,6 +158,13 @@ if [ -x "$TIFY_BIN" ]; then
     else
         warn "tify --help 报错"
     fi
+fi
+
+if [ -x /data/data/com.termux/files/usr/bin/ffmpeg ] \
+    && /data/data/com.termux/files/usr/bin/ffmpeg -version >/dev/null 2>&1; then
+    ok "ffmpeg 可用（compress-image / music / video 能跑）"
+else
+    warn "ffmpeg 不可用，三个压缩块会被跳过"
 fi
 
 if command -v termux-job-scheduler >/dev/null 2>&1; then
