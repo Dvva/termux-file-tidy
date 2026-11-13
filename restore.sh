@@ -124,19 +124,25 @@ bash "$DIR/mkcmd" || die "mkcmd 执行失败"
 
 # ── 4. 每日定时任务 ────────────────────────────────────────────
 step "4/5 每日定时任务"
+# termux-api 包只是客户端，没有 Termux:API 应用时调用会一直挂住，先探测
+if ! timeout 10 termux-battery-status >/dev/null 2>&1; then
+    warn "Termux:API 应用不可用：装好 Termux:API（F-Droid）并打开一次再重跑"
+    warn "否则 termux-job-scheduler 会卡住，定时任务装不了（分类功能本身不受影响）"
+    DO_JOB=0
+fi
 if [ "$DO_JOB" -eq 0 ]; then
-    warn "已跳过（--no-job）"
+    warn "跳过定时任务注册"
 elif ! command -v termux-job-scheduler >/dev/null 2>&1; then
     warn "找不到 termux-job-scheduler，跳过节任务（termux-api 包没装上？）"
 else
     has_job=0
-    if termux-job-scheduler --pending 2>/dev/null | grep -q 'termux-file-tidy'; then
+    if timeout 15 termux-job-scheduler --pending 2>/dev/null | grep -q 'termux-file-tidy'; then
         has_job=1
     fi
     if [ "$has_job" -eq 1 ] && [ "$FORCE_JOB" -eq 0 ]; then
         ok "已有注册，跳过（要重建加 --force-job）"
     else
-        bash "$DIR/install.sh" || die "install.sh 执行失败"
+        bash "$DIR/install.sh" || warn "install.sh 未成功，定时任务没注册上"
     fi
 fi
 
@@ -169,7 +175,7 @@ fi
 
 if command -v termux-job-scheduler >/dev/null 2>&1; then
     echo "   当前任务："
-    termux-job-scheduler --pending 2>/dev/null | sed 's/^/     /' || true
+    timeout 15 termux-job-scheduler --pending 2>/dev/null | sed 's/^/     /' || echo "     （读取超时：Termux:API 应用没装或没运行）"
 fi
 
 printf '\n恢复完成。新开一个终端（或 source ~/.bashrc）后执行：tify --help\n'

@@ -21,14 +21,14 @@ command -v termux-job-scheduler >/dev/null 2>&1 \
 
 case "${1:-}" in
     --remove)
-        termux-job-scheduler --cancel --job-id 1 2>/dev/null \
-            || termux-job-scheduler --cancel-all 2>/dev/null \
+        timeout 15 termux-job-scheduler --cancel --job-id 1 2>/dev/null \
+            || timeout 15 termux-job-scheduler --cancel-all 2>/dev/null \
             || echo "没有可取消的任务"
         echo "已取消定时任务"
         exit 0
         ;;
     --list)
-        termux-job-scheduler --pending
+        timeout 15 termux-job-scheduler --pending
         exit 0
         ;;
 esac
@@ -41,7 +41,7 @@ command -v python3 >/dev/null 2>&1 || die "找不到 python3，请先 pkg instal
 python3 -c "import sys; sys.exit(0)" || die "python3 无法运行"
 
 echo "注册每日任务：$SCRIPT"
-termux-job-scheduler \
+timeout 60 termux-job-scheduler \
     --script "$SCRIPT" \
     --period-ms "$PERIOD_MS" \
     --persisted true \
@@ -50,7 +50,7 @@ termux-job-scheduler \
 
 echo
 echo "当前已注册的任务："
-termux-job-scheduler --pending 2>/dev/null || true
+timeout 15 termux-job-scheduler --pending 2>/dev/null || true
 
 echo
 echo "完成。日志在 ~/.local/state/file_tidy/"
